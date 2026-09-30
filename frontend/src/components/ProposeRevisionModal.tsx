@@ -151,10 +151,18 @@ export default function ProposeRevisionModal({
     );
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="propose-revision-modal-title"
+    >
       <div ref={modalRef} className="bg-theme-bg border border-theme-border rounded-xl shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between p-4 border-b border-theme-border">
-          <h2 className="text-lg font-semibold text-theme-heading">
+          <h2
+            id="propose-revision-modal-title"
+            className="text-lg font-semibold text-theme-heading"
+          >
             Propose revision
           </h2>
           <button
