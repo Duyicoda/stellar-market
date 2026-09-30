@@ -86,12 +86,6 @@ export default function FeaturedJobsCarousel() {
           className="flex overflow-x-auto gap-6 pb-6 snap-x snap-mandatory scrollbar-hide"
           style={{ scrollbarWidth: "none", msOverflowStyle: "none" }}
         >
-          <style dangerouslySetInnerHTML={{ __html: `
-            .scrollbar-hide::-webkit-scrollbar {
-                display: none;
-            }
-          `}} />
-          
           {loading ? (
             Array.from({ length: 4 }).map((_, i) => (
               <div key={i} className="min-w-[300px] md:min-w-[400px] flex-shrink-0 snap-start">

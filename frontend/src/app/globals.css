@@ -118,3 +118,10 @@
     transition: none !important;
   }
 }
+
+/* Hides the scrollbar on any .scrollbar-hide element (horizontal carousels,
+   scrollable lists). Static, so it belongs here rather than being injected
+   per-component via a <style> tag on every render (issue #1341). */
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}

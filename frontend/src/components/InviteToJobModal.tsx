@@ -214,6 +214,9 @@ export default function InviteToJobModal({
                 placeholder="Add a short note about why you'd like to work together…"
                 className="w-full rounded-lg border border-theme-border bg-theme-bg p-3 text-sm text-theme-heading placeholder:text-theme-text/50 focus:outline-none focus:ring-2 focus:ring-stellar-blue/40"
               />
+              <p className="text-xs text-theme-text mt-1 text-right">
+                {message.length}/{MAX_MESSAGE_LENGTH}
+              </p>
             </div>
 
             <div className="flex items-center justify-between gap-3">

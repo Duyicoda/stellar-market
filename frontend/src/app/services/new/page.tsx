@@ -6,9 +6,10 @@ import { Plus, Loader2, Tag } from "lucide-react";
 import axios from "axios";
 import { useAuth } from "@/context/AuthContext";
 import { useToast } from "@/components/Toast";
+import { SERVICE_CATEGORIES } from "@/constants/services";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api/v1";
-const categories = ["Development", "Design", "Writing", "Marketing", "Other"];
+const categories = SERVICE_CATEGORIES;
 const STORAGE_KEY = "service-form-draft";
 
 export default function NewServicePage() {

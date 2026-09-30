@@ -917,7 +917,7 @@ export default function SettingsPage() {
         {/* Security Tab */}
         {activeSettingsTab === "security" && (
           <div className="card space-y-6">
-            <h2 className="text-xl font-semibold text-dark-heading flex items-center gap-2">
+            <h2 className="text-xl font-semibold text-theme-heading flex items-center gap-2">
               <ShieldCheck size={20} />
               Security
             </h2>
@@ -985,7 +985,7 @@ export default function SettingsPage() {
                   Save these recovery codes now. Each code works once instead of your authenticator at login. They will not be shown again.
                 </p>
                 <div className="flex items-center justify-between gap-2">
-                  <p className="text-dark-muted text-xs">Recovery codes</p>
+                  <p className="text-theme-text text-xs">Recovery codes</p>
                   <button
                     type="button"
                     onClick={copyRecoveryCodes}
@@ -999,7 +999,7 @@ export default function SettingsPage() {
                   {recoveryCodesPending.map((code, i) => (
                     <code
                       key={i}
-                      className="block p-2 bg-dark-bg border border-dark-border rounded text-center text-sm text-dark-text font-mono"
+                      className="block p-2 bg-theme-bg border border-theme-border rounded text-center text-sm text-theme-text font-mono"
                     >
                       {code}
                     </code>
@@ -1021,8 +1021,8 @@ export default function SettingsPage() {
                 </div>
 
                 {showRegenerateModal ? (
-                  <form onSubmit={handleRegenerateRecovery} className="space-y-3 rounded-lg border border-dark-border p-4">
-                    <p className="text-dark-muted text-sm">
+                  <form onSubmit={handleRegenerateRecovery} className="space-y-3 rounded-lg border border-theme-border p-4">
+                    <p className="text-theme-text text-sm">
                       Enter a 6-digit code from your authenticator. This replaces all existing recovery codes.
                     </p>
                     <input
@@ -1047,7 +1047,7 @@ export default function SettingsPage() {
                       <button
                         type="button"
                         onClick={() => { setShowRegenerateModal(false); setRegenerateTotp(""); }}
-                        className="px-4 py-2 border border-dark-border text-dark-text rounded-lg text-sm hover:bg-dark-bg transition-colors"
+                        className="px-4 py-2 border border-theme-border text-theme-text rounded-lg text-sm hover:bg-theme-bg transition-colors"
                       >
                         Cancel
                       </button>
@@ -1055,7 +1055,7 @@ export default function SettingsPage() {
                   </form>
                 ) : showDisableModal ? (
                   <form onSubmit={handleDisable2FA} className="space-y-3">
-                    <p className="text-dark-muted text-sm">Enter your password to disable 2FA:</p>
+                    <p className="text-theme-text text-sm">Enter your password to disable 2FA:</p>
                     <input
                       type="password"
                       value={disablePassword}
@@ -1076,7 +1076,7 @@ export default function SettingsPage() {
                       <button
                         type="button"
                         onClick={() => { setShowDisableModal(false); setDisablePassword(""); }}
-                        className="px-4 py-2 border border-dark-border text-dark-text rounded-lg text-sm hover:bg-dark-bg transition-colors"
+                        className="px-4 py-2 border border-theme-border text-theme-text rounded-lg text-sm hover:bg-theme-bg transition-colors"
                       >
                         Cancel
                       </button>
@@ -1106,29 +1106,29 @@ export default function SettingsPage() {
             ) : twoFASetupData ? (
               <div className="space-y-6">
                 <div className="text-center">
-                  <p className="text-dark-muted text-sm mb-4">
+                  <p className="text-theme-text text-sm mb-4">
                     Scan this QR code with your authenticator app (Google Authenticator, Authy, etc.)
                   </p>
                   <img
                     src={twoFASetupData.qrCode}
                     alt="2FA QR Code"
-                    className="mx-auto w-48 h-48 rounded-lg border border-dark-border"
+                    className="mx-auto w-48 h-48 rounded-lg border border-theme-border"
                   />
                 </div>
 
                 <div>
-                  <p className="text-dark-muted text-xs mb-1">Manual entry key:</p>
-                  <code className="block p-2 bg-dark-bg border border-dark-border rounded text-sm text-dark-text break-all">
+                  <p className="text-theme-text text-xs mb-1">Manual entry key:</p>
+                  <code className="block p-2 bg-theme-bg border border-theme-border rounded text-sm text-theme-text break-all">
                     {twoFASetupData.secret}
                   </code>
                 </div>
 
-                <p className="text-dark-muted text-xs">
+                <p className="text-theme-text text-xs">
                   After you verify with a 6-digit app code, you will receive one-time recovery codes to download or copy. Store them offline.
                 </p>
 
                 <form onSubmit={handleVerify2FA} className="space-y-3">
-                  <label className="block text-sm font-medium text-dark-heading">
+                  <label className="block text-sm font-medium text-theme-heading">
                     Enter a code from your authenticator app to verify:
                   </label>
                   <input
@@ -1153,7 +1153,7 @@ export default function SettingsPage() {
                     <button
                       type="button"
                       onClick={() => { setTwoFASetupData(null); setVerifyCode(""); }}
-                      className="px-4 py-2 border border-dark-border text-dark-text rounded-lg text-sm hover:bg-dark-bg transition-colors"
+                      className="px-4 py-2 border border-theme-border text-theme-text rounded-lg text-sm hover:bg-theme-bg transition-colors"
                     >
                       Cancel
                     </button>
@@ -1162,7 +1162,7 @@ export default function SettingsPage() {
               </div>
             ) : (
               <div className="space-y-4">
-                <p className="text-dark-muted text-sm">
+                <p className="text-theme-text text-sm">
                   Add an extra layer of security to your account by enabling two-factor authentication with an authenticator app.
                 </p>
                 <button

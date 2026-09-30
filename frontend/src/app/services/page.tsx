@@ -9,19 +9,14 @@ import EmptyState from "@/components/EmptyState";
 import { useServiceFilters } from "@/hooks/useServiceFilters";
 import { useInfiniteScroll } from "@/hooks/useInfiniteScroll";
 import { ServiceListing, PaginatedResponse } from "@/types";
+import { SERVICE_CATEGORIES } from "@/constants/services";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api/v1";
 const SERVICES_PER_PAGE = 10;
 
-const categories = [
-  "All",
-  "Frontend",
-  "Backend",
-  "Smart Contract",
-  "Design",
-  "Mobile",
-  "Documentation",
-];
+// "All" is a UI-only sentinel (no category filter applied), not a real
+// category — the real list is the single shared source of truth (#1344).
+const categories = ["All", ...SERVICE_CATEGORIES];
 
 const POPULAR_SKILLS = [
   "React",
