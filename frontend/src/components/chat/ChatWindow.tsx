@@ -34,6 +34,7 @@ interface ChatWindowProps {
   currentUserId: string;
   partnerId: string;
   partnerUsername: string;
+  partnerAvatarUrl?: string | null;
   currentUsername?: string;
   currentUserAvatarUrl?: string | null;
   initialMessages: ChatMessage[];
@@ -43,6 +44,7 @@ export default function ChatWindow({
   currentUserId,
   partnerId,
   partnerUsername,
+  partnerAvatarUrl = null,
   currentUsername = "",
   currentUserAvatarUrl = null,
   initialMessages,
@@ -238,7 +240,7 @@ export default function ChatWindow({
       {/* Header */}
       <div className="px-4 py-3 border-b border-theme-border flex items-center gap-3">
         <Avatar
-          src={partnerUsername ? null : undefined}
+          src={partnerAvatarUrl ?? undefined}
           alt={partnerUsername}
           size={32}
         />

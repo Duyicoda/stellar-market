@@ -406,15 +406,27 @@ fn require_open_for_voting(env: &Env, proposal: &GovernanceProposal) -> Result<(
 
 #[contractimpl]
 impl EscrowContract {
-    /// Configure (and thereby enable) reputation-weighted governance. Callable
-    /// only by a registered multisig signer — the closed signer set voluntarily
-    /// hands parameter control to the stakeholder vote. May be called again by a
-    /// signer to re-tune parameters; there is intentionally no way to *disable*
-    /// governance, so parameter control cannot be silently reclaimed.
+    /// Configure (and thereby enable) reputation-weighted governance. Routed
+    /// through the standard multisig admin-action flow
+    /// (`propose_admin_action`/`approve_admin_action`): the caller must be a
+    /// registered signer, the reconfiguration needs threshold signer approvals,
+    /// and — like other sensitive admin actions — it is subject to the 48-hour
+    /// timelock before it can execute. This ensures no single compromised or
+    /// rogue signer can unilaterally reconfigure governance parameters,
+    /// including the reputation contract address that every vote's weight is
+    /// sourced from. Returns the id of the multisig proposal.
+    ///
+    /// May be called again to re-tune parameters; there is intentionally no way
+    /// to *disable* governance, so parameter control cannot be silently
+    /// reclaimed.
     ///
     /// - `reputation`: contract exposing `get_gov_weight(Address) -> (u64, u64)`.
     /// - `pass_threshold_bps`: must be in `1..=10000`.
     /// - `voting_period_secs`: must be `> 0`.
+    ///
+    /// # Errors
+    /// * `InvalidParam` — a parameter is out of range
+    /// * `NotAdmin`     — the caller is not a registered multisig signer
     #[allow(clippy::too_many_arguments)]
     pub fn configure_governance(
         env: Env,
@@ -426,31 +438,28 @@ impl EscrowContract {
         quorum_votes: u128,
         pass_threshold_bps: u32,
         min_proposer_weight: u64,
-    ) -> Result<(), GovError> {
-        admin.require_auth();
-        if !crate::is_signer(&env, &admin) {
-            return Err(GovError::NotAdmin);
-        }
+    ) -> Result<u64, GovError> {
         if voting_period_secs == 0 || pass_threshold_bps == 0 || pass_threshold_bps > 10_000 {
             return Err(GovError::InvalidParam);
         }
-
-        let config = GovernanceConfig {
-            reputation,
-            voting_period_secs,
-            timelock_secs,
-            grace_secs,
-            quorum_votes,
-            pass_threshold_bps,
-            min_proposer_weight,
-        };
-        env.storage().instance().set(&GovKey::Config, &config);
-
-        env.events().publish(
-            (symbol_short!("gov"), symbol_short!("config")),
-            (admin, config.reputation, config.voting_period_secs),
-        );
-        Ok(())
+        Self::propose_admin_action(
+            env,
+            admin,
+            AdminAction::ConfigureGovernance(
+                reputation,
+                voting_period_secs,
+                timelock_secs,
+                grace_secs,
+                quorum_votes,
+                pass_threshold_bps,
+                min_proposer_weight,
+            ),
+        )
+        // The only proposal-path failure reachable here is SignerNotFound
+        // (the caller is not a registered signer): the payload is validated
+        // above, ConfigureGovernance is not a governable action, and the
+        // 48-hour timelock prevents auto-execution.
+        .map_err(|_| GovError::NotAdmin)
     }
 
     /// Return the governance configuration, if governance is enabled.
