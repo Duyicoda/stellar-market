@@ -77,7 +77,29 @@ router.get(
     >;
     const skip = (page - 1) * limit;
 
-    const where: Prisma.MilestoneWhereInput = {};
+    // If a specific jobId is requested, verify the caller is a party to that job
+    // before returning any results for it.
+    if (jobId) {
+      const job = await prisma.job.findUnique({ where: { id: jobId } });
+      if (!job) {
+        return res.status(404).json({ error: "Job not found." });
+      }
+      const isParty =
+        job.clientId === req.userId || job.freelancerId === req.userId;
+      if (!isParty) {
+        return res
+          .status(403)
+          .json({ error: "Not authorized to view milestones for this job." });
+      }
+    }
+
+    // Always scope results to milestones belonging to jobs the caller is a
+    // client or freelancer on — preventing cross-user data leaks.
+    const where: Prisma.MilestoneWhereInput = {
+      job: {
+        OR: [{ clientId: req.userId }, { freelancerId: req.userId }],
+      },
+    };
     if (jobId) where.jobId = jobId;
     if (status) where.status = status;
 

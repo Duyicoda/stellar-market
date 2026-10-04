@@ -17,6 +17,7 @@ import type { DisputeEvidence, EvidenceVerification } from "@/types";
 import LocalTimestamp from "@/components/LocalTimestamp";
 import EvidenceVideoPlayer from "@/components/EvidenceVideoPlayer";
 import { isVideoEvidence } from "@/lib/mediaRecording";
+import { useToast } from "@/components/Toast";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api/v1";
 
@@ -44,11 +45,13 @@ export default function EvidenceViewer({
   >({});
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const [videoUrls, setVideoUrls] = useState<Record<string, string>>({});
   const [loadingVideoId, setLoadingVideoId] = useState<string | null>(null);
   const listRef = useRef<HTMLUListElement>(null);
   const videoUrlsRef = useRef(videoUrls);
   videoUrlsRef.current = videoUrls;
+  const { toast } = useToast();
 
   // Revoke any created object URLs when the viewer unmounts.
   useEffect(() => {
@@ -131,6 +134,7 @@ export default function EvidenceViewer({
 
   const downloadItem = useCallback(async (item: DisputeEvidence) => {
     setDownloadingId(item.id);
+    setDownloadError(null);
     try {
       const token = localStorage.getItem("stellarmarket_jwt");
       const response = await axios.get(
@@ -146,10 +150,14 @@ export default function EvidenceViewer({
       anchor.download = item.fileName;
       anchor.click();
       URL.revokeObjectURL(url);
+    } catch {
+      const message = "Download failed. Please try again.";
+      setDownloadError(message);
+      toast.error(message);
     } finally {
       setDownloadingId(null);
     }
-  }, [disputeId]);
+  }, [disputeId, toast]);
 
   // Fetch a video evidence blob (authorized) and expose it as an object URL so
   // the dedicated player can stream it without leaking the auth token into a
