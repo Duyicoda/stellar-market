@@ -27,8 +27,17 @@ jest.mock("jsonwebtoken", () => ({
 }));
 
 // Mock Prisma
+type MockPrismaClient = {
+  user: {
+    findFirst: jest.Mock;
+    findUnique: jest.Mock;
+    create: jest.Mock;
+    update: jest.Mock;
+  };
+};
+
 jest.mock("@prisma/client", () => {
-  const mockPrisma = {
+  const mockPrisma: MockPrismaClient = {
     user: {
       findFirst: jest.fn(),
       findUnique: jest.fn(),
@@ -75,9 +84,9 @@ jest.mock("../../utils/token", () => ({
 
 import authRoutes from "../auth.routes";
 
-const { __mockPrisma: mockPrisma } = jest.requireMock(
-  "@prisma/client",
-) as any;
+const { __mockPrisma: mockPrisma } = jest.requireMock("@prisma/client") as {
+  __mockPrisma: MockPrismaClient;
+};
 
 const app = express();
 app.use(express.json());

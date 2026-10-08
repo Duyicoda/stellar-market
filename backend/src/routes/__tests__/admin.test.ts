@@ -4,8 +4,34 @@ import adminRoutes from "../admin";
 import { DisputeStatus } from "@prisma/client";
 
 // Mock Prisma
+type MockPrismaClient = {
+  user: {
+    findUnique: jest.Mock;
+    findMany: jest.Mock;
+    count: jest.Mock;
+    update: jest.Mock;
+  };
+  job: {
+    findUnique: jest.Mock;
+    findMany: jest.Mock;
+    count: jest.Mock;
+    update: jest.Mock;
+  };
+  dispute: {
+    findUnique: jest.Mock;
+    findMany: jest.Mock;
+    update: jest.Mock;
+  };
+  auditLog: {
+    create: jest.Mock;
+  };
+  notification: {
+    create: jest.Mock;
+  };
+};
+
 jest.mock("@prisma/client", () => {
-  const mockPrisma = {
+  const mockPrisma: MockPrismaClient = {
     user: {
       findUnique: jest.fn(),
       findMany: jest.fn(),
@@ -57,7 +83,9 @@ jest.mock("../../socket", () => ({
   })),
 }));
 
-const { __mockPrisma: mockPrisma } = jest.requireMock("@prisma/client") as any;
+const { __mockPrisma: mockPrisma } = jest.requireMock("@prisma/client") as {
+  __mockPrisma: MockPrismaClient;
+};
 
 const app = express();
 app.use(express.json());

@@ -24,7 +24,11 @@ jest.mock("../../lib/cache", () => ({
 
 describe("Platform Routes", () => {
   let app: express.Express;
-  let mockPrisma: any;
+  let mockPrisma: {
+    job: { count: jest.Mock; aggregate: jest.Mock };
+    user: { count: jest.Mock };
+    dispute: { count: jest.Mock };
+  };
 
   beforeEach(() => {
     app = express();
@@ -33,21 +37,23 @@ describe("Platform Routes", () => {
     
     // We instantiate PrismaClient here, the mock will return the same mocked object
     // that the route uses when it instantiates its own PrismaClient.
-    mockPrisma = new PrismaClient();
+    mockPrisma = new PrismaClient() as unknown as typeof mockPrisma;
     jest.clearAllMocks();
   });
 
   it("returns a 200 with stats shape and without PII", async () => {
-    mockPrisma.job.count.mockImplementation((args: any) => {
-      if (!args) return Promise.resolve(100);
-      if (args.where?.status === "OPEN") return Promise.resolve(30);
-      if (args.where?.status === "COMPLETED") return Promise.resolve(60);
-      return Promise.resolve(0);
-    });
+    mockPrisma.job.count.mockImplementation(
+      (args?: { where?: { status?: string } }) => {
+        if (!args) return Promise.resolve(100);
+        if (args.where?.status === "OPEN") return Promise.resolve(30);
+        if (args.where?.status === "COMPLETED") return Promise.resolve(60);
+        return Promise.resolve(0);
+      },
+    );
 
     mockPrisma.user.count.mockResolvedValue(50);
 
-    mockPrisma.dispute.count.mockImplementation((args: any) => {
+    mockPrisma.dispute.count.mockImplementation((args?: unknown) => {
       if (!args) return Promise.resolve(10);
       return Promise.resolve(9); // resolved
     });

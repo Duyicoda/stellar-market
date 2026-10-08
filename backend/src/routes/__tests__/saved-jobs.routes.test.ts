@@ -23,8 +23,30 @@ jest.mock("../../services/contract.service", () => ({
 }));
 
 // Mock Prisma
+type MockPrismaClient = {
+  user: {
+    create: jest.Mock;
+    findUnique: jest.Mock;
+    deleteMany: jest.Mock;
+  };
+  job: {
+    create: jest.Mock;
+    findUnique: jest.Mock;
+    delete: jest.Mock;
+    deleteMany: jest.Mock;
+  };
+  savedJob: {
+    create: jest.Mock;
+    findUnique: jest.Mock;
+    findMany: jest.Mock;
+    count: jest.Mock;
+    delete: jest.Mock;
+    deleteMany: jest.Mock;
+  };
+};
+
 jest.mock("@prisma/client", () => {
-  const mockPrisma = {
+  const mockPrisma: MockPrismaClient = {
     user: {
       create: jest.fn(),
       findUnique: jest.fn(),
@@ -46,24 +68,24 @@ jest.mock("@prisma/client", () => {
     },
   };
   return {
-    PrismaClient: jest.fn(() => mockPrisma) as any,
+    PrismaClient: jest.fn(() => mockPrisma),
     UserRole: {
       CLIENT: "CLIENT",
       FREELANCER: "FREELANCER",
       ADMIN: "ADMIN",
-    } as any,
+    },
     JobStatus: {
       OPEN: "OPEN",
       IN_PROGRESS: "IN_PROGRESS",
       COMPLETED: "COMPLETED",
       CANCELLED: "CANCELLED",
       DISPUTED: "DISPUTED",
-    } as any,
+    },
   };
 });
 
 import { PrismaClient } from "@prisma/client";
-const prisma = new PrismaClient() as any;
+const prisma = new PrismaClient() as unknown as MockPrismaClient;
 
 const app = express();
 app.use(express.json());

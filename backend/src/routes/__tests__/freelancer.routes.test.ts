@@ -15,7 +15,9 @@ jest.mock("@prisma/client", () => {
 
 import { PrismaClient } from "@prisma/client";
 
-const prismaMock = new PrismaClient() as any;
+const prismaMock = new PrismaClient() as unknown as {
+  $queryRaw: jest.Mock;
+};
 
 const app = express();
 app.use(express.json());

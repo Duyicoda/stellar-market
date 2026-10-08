@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
+import { useSearchParams, useRouter } from "next/navigation";
 import { MessageSquare, Search, User, Briefcase } from "lucide-react";
 import axios from "axios";
 import { Conversation } from "@/types";
@@ -9,9 +10,21 @@ import Image from "next/image";
 import { useAuth } from "@/context/AuthContext";
 import { useDelay } from "@/hooks/useDelay";
 import MessageSkeleton from "@/components/skeletons/MessageSkeleton";
+import Avatar from "@/components/Avatar";
 
 export default function InboxPage() {
+  return (
+    <Suspense fallback={null}>
+      <InboxPageContent />
+    </Suspense>
+  );
+}
+
+function InboxPageContent() {
   const { token } = useAuth();
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const jobId = searchParams.get("jobId");
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
@@ -24,12 +37,22 @@ export default function InboxPage() {
         if (!token) return;
         setLoading(true);
         const response = await axios.get(
-          `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api"}/messages`,
+          `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api/v1"}/messages`,
           {
             headers: { Authorization: `Bearer ${token}` },
           },
         );
         setConversations(response.data);
+
+        // Auto-navigate to conversation matching jobId if provided
+        if (jobId) {
+          const matchingConversation = response.data.find(
+            (conv: Conversation) => conv.job?.id === jobId,
+          );
+          if (matchingConversation) {
+            router.replace(`/messages/${matchingConversation.id}`);
+          }
+        }
       } catch (err) {
         console.error("Fetch conversations error:", err);
       } finally {
@@ -38,7 +61,7 @@ export default function InboxPage() {
     };
 
     fetchConversations();
-  }, [token]);
+  }, [token, jobId, router]);
 
   const filteredConversations = conversations.filter(
     (conv) =>
@@ -86,17 +109,12 @@ export default function InboxPage() {
           filteredConversations.map((conv) => (
             <Link key={conv.id} href={`/messages/${conv.id}`}>
               <div className="card hover:border-stellar-blue/30 transition-all group flex items-start gap-4 cursor-pointer relative">
-                <div className="w-12 h-12 rounded-full bg-gradient-to-br from-stellar-blue to-stellar-purple flex-shrink-0 flex items-center justify-center text-white font-bold overflow-hidden border border-theme-border">
-                  {conv.otherUser.avatarUrl ? (
-                    <Image
-                      src={conv.otherUser.avatarUrl}
-                      alt={conv.otherUser.username}
-                      className="w-full h-full object-cover"
-                    />
-                  ) : (
-                    <User size={24} className="text-white/50" />
-                  )}
-                </div>
+                <Avatar
+                  src={conv.otherUser.avatarUrl}
+                  alt={conv.otherUser.username}
+                  size={48}
+                  className="flex-shrink-0 border border-theme-border"
+                />
 
                 <div className="flex-1 min-w-0">
                   <div className="flex justify-between items-start mb-1">

@@ -1,14 +1,11 @@
 import "@testing-library/jest-dom";
 import { render, screen, waitFor } from "@testing-library/react";
 import DisputeVoteProgress from "../DisputeVoteProgress";
-import { useDisputeStatus } from "@/hooks/useDisputeStatus";
 import type { Dispute } from "@/types";
 
-// Mock the useDisputeStatus hook
-jest.mock("@/hooks/useDisputeStatus");
-
-const mockUseDisputeStatus = useDisputeStatus as jest.MockedFunction<typeof useDisputeStatus>;
-
+// #1126: the component now reads from the shared dispute state (or an explicit
+// `initialDispute` prop) instead of its own poll. These tests feed the dispute
+// via `initialDispute`, exercising the identical rendering logic.
 describe("DisputeVoteProgress", () => {
   const mockDispute = {
     id: "1",
@@ -67,32 +64,14 @@ describe("DisputeVoteProgress", () => {
     ],
   } as unknown as Dispute;
 
-  beforeEach(() => {
-    jest.clearAllMocks();
-  });
-
   it("renders loading state initially", () => {
-    mockUseDisputeStatus.mockReturnValue({
-      dispute: null,
-      isLoading: true,
-      error: null,
-      refetch: jest.fn(),
-    });
-
-    const { container } = render(<DisputeVoteProgress disputeId="1" />);
+    const { container } = render(<DisputeVoteProgress />);
 
     expect(container.querySelector(".animate-pulse")).toBeInTheDocument();
   });
 
   it("displays vote counts correctly", async () => {
-    mockUseDisputeStatus.mockReturnValue({
-      dispute: mockDispute,
-      isLoading: false,
-      error: null,
-      refetch: jest.fn(),
-    });
-
-    render(<DisputeVoteProgress disputeId="1" />);
+    render(<DisputeVoteProgress initialDispute={mockDispute} />);
 
     await waitFor(() => {
       expect(screen.getByText("5")).toBeInTheDocument(); // totalVotes
@@ -103,14 +82,7 @@ describe("DisputeVoteProgress", () => {
   });
 
   it("shows correct progress percentage", async () => {
-    mockUseDisputeStatus.mockReturnValue({
-      dispute: mockDispute,
-      isLoading: false,
-      error: null,
-      refetch: jest.fn(),
-    });
-
-    render(<DisputeVoteProgress disputeId="1" />);
+    render(<DisputeVoteProgress initialDispute={mockDispute} />);
 
     await waitFor(() => {
       expect(screen.getByText("100%")).toBeInTheDocument(); // 5/5 votes = 100%
@@ -118,14 +90,7 @@ describe("DisputeVoteProgress", () => {
   });
 
   it("displays 'Ready to resolve' when minimum votes reached", async () => {
-    mockUseDisputeStatus.mockReturnValue({
-      dispute: mockDispute,
-      isLoading: false,
-      error: null,
-      refetch: jest.fn(),
-    });
-
-    render(<DisputeVoteProgress disputeId="1" />);
+    render(<DisputeVoteProgress initialDispute={mockDispute} />);
 
     await waitFor(() => {
       expect(screen.getByText("Ready to resolve")).toBeInTheDocument();
@@ -139,14 +104,7 @@ describe("DisputeVoteProgress", () => {
       votesForFreelancer: 1,
     };
 
-    mockUseDisputeStatus.mockReturnValue({
-      dispute: disputeNeedingVotes,
-      isLoading: false,
-      error: null,
-      refetch: jest.fn(),
-    });
-
-    render(<DisputeVoteProgress disputeId="1" />);
+    render(<DisputeVoteProgress initialDispute={disputeNeedingVotes} />);
 
     await waitFor(() => {
       expect(screen.getByText("3 more votes needed")).toBeInTheDocument();
@@ -154,14 +112,7 @@ describe("DisputeVoteProgress", () => {
   });
 
   it("anonymizes voter addresses when showVoterDetails is true", async () => {
-    mockUseDisputeStatus.mockReturnValue({
-      dispute: mockDispute,
-      isLoading: false,
-      error: null,
-      refetch: jest.fn(),
-    });
-
-    render(<DisputeVoteProgress disputeId="1" showVoterDetails={true} />);
+    render(<DisputeVoteProgress initialDispute={mockDispute} showVoterDetails={true} />);
 
     await waitFor(() => {
       expect(screen.getByText("Recent Voters (Anonymized)")).toBeInTheDocument();
@@ -171,14 +122,7 @@ describe("DisputeVoteProgress", () => {
   });
 
   it("does not show voter details when showVoterDetails is false", async () => {
-    mockUseDisputeStatus.mockReturnValue({
-      dispute: mockDispute,
-      isLoading: false,
-      error: null,
-      refetch: jest.fn(),
-    });
-
-    render(<DisputeVoteProgress disputeId="1" showVoterDetails={false} />);
+    render(<DisputeVoteProgress initialDispute={mockDispute} showVoterDetails={false} />);
 
     await waitFor(() => {
       expect(screen.queryByText("Recent Voters (Anonymized)")).not.toBeInTheDocument();

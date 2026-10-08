@@ -21,15 +21,20 @@ import {
   loginSchema,
   walletAuthSchema,
   walletLinkSchema,
+  walletVerifySchema,
   forgotPasswordSchema,
   resetPasswordSchema,
+  changePasswordSchema,
   verifyEmailParamSchema,
   twoFactorVerifySchema,
   twoFactorDisableSchema,
   twoFactorValidateSchema,
 } from "../schemas";
+import RedisClient from "../lib/redis";
+import { invalidateTokenVersionCache } from "../lib/token-version";
 import { generateToken, hashToken } from "../utils/token";
 import { sendPasswordResetEmail, sendVerificationEmail } from "../utils/email";
+import { logger } from "../lib/logger";
 
 const ACCESS_TOKEN_EXPIRY = "15m";
 const REFRESH_TOKEN_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -42,6 +47,23 @@ function setRefreshCookie(res: Response, token: string) {
     maxAge: REFRESH_TOKEN_EXPIRY_MS,
     path: "/",
   });
+}
+
+/**
+ * Sign a full-session access token. The user's `tokenVersion` is embedded as a
+ * claim so the auth middleware can reject the token after a password change
+ * increments the stored version (issue #787).
+ */
+function signAccessToken(
+  userId: string,
+  tokenVersion: number,
+  extraClaims: Record<string, unknown> = {},
+): string {
+  return jwt.sign(
+    { userId, tokenVersion, ...extraClaims },
+    config.jwtSecret,
+    { expiresIn: ACCESS_TOKEN_EXPIRY },
+  );
 }
 
 async function issueRefreshToken(userId: string): Promise<string> {
@@ -79,6 +101,7 @@ function userPayload(user: {
   role: "CLIENT" | "FREELANCER" | "ADMIN";
   emailVerified?: boolean;
   password?: string | null;
+  completedOnboarding?: boolean;
 }) {
   return {
     id: user.id,
@@ -87,6 +110,7 @@ function userPayload(user: {
     email: user.email,
     role: user.role,
     emailVerified: user.emailVerified,
+    completedOnboarding: user.completedOnboarding,
     authMethods: {
       email: Boolean(user.email && user.password),
       wallet: Boolean(user.walletAddress),
@@ -120,10 +144,9 @@ async function sendSession(res: Response, user: {
   role: "CLIENT" | "FREELANCER" | "ADMIN";
   emailVerified?: boolean;
   password?: string | null;
+  tokenVersion?: number;
 }, status = 200) {
-  const token = jwt.sign({ userId: user.id }, config.jwtSecret, {
-    expiresIn: ACCESS_TOKEN_EXPIRY,
-  });
+  const token = signAccessToken(user.id, user.tokenVersion ?? 0);
   const refreshRaw = await issueRefreshToken(user.id);
   setRefreshCookie(res, refreshRaw);
   res.status(status).json({ user: userPayload(user), token });
@@ -262,11 +285,24 @@ router.post(
       },
     });
 
-    if (email) {
+    let emailSent = false;
+    try {
       await sendVerificationEmail(email, rawToken);
+      emailSent = true;
+    } catch (err) {
+      logger.error({ err, userId: user.id }, "Failed to send verification email on registration");
     }
 
-    await sendSession(res, user, 201);
+    // No session is issued here on purpose — the user isn't logged in until
+    // they click the verification link (see GET /verify-email/:token), which
+    // is what actually establishes the session.
+    res.status(201).json({
+      message: emailSent
+        ? "Account created. Check your email to verify before logging in."
+        : "Account created, but we couldn't send the verification email right now. Use the resend option to try again.",
+      email: user.email,
+      emailSent,
+    });
   }),
 );
 
@@ -307,6 +343,33 @@ router.post(
     }
 
     await sendSession(res, user);
+  }),
+);
+
+/**
+ * GET /auth/wallet/exists?address=...
+ * Tells the client, before it commits to signing a login message, whether an
+ * account already exists for a wallet address — purely so the UI can warn
+ * "this will create a new account" instead of silently doing so for a wallet
+ * the user only meant to link to an account they already have. Returns only
+ * a boolean; no account details are exposed.
+ */
+router.get(
+  "/wallet/exists",
+  loginRateLimiter,
+  asyncHandler(async (req: Request, res: Response) => {
+    const address = typeof req.query.address === "string" ? req.query.address : "";
+    try {
+      Keypair.fromPublicKey(address);
+    } catch {
+      return res.status(400).json({ error: "Invalid Stellar address." });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { walletAddress: address },
+      select: { id: true },
+    });
+    res.json({ exists: !!user });
   }),
 );
 
@@ -390,6 +453,96 @@ router.delete(
     });
 
     res.json({ user: userPayload(updated) });
+  }),
+);
+
+// ─── Wallet Challenge / Verify ───────────────────────────────────────────────
+
+const WALLET_CHALLENGE_TTL_SECS = 300; // 5 minutes
+const WALLET_CHALLENGE_KEY = (userId: string) => `wallet_challenge:${userId}`;
+
+/**
+ * POST /auth/wallet/challenge
+ * Issues a one-time challenge that the client must sign with their Stellar
+ * private key to prove ownership before binding a wallet address.
+ */
+router.post(
+  "/wallet/challenge",
+  authenticate,
+  asyncHandler(async (req: AuthRequest, res: Response) => {
+    const nonce = crypto.randomBytes(32).toString("hex");
+    const challenge = `stellar-market:bind:${req.userId}:${nonce}`;
+    const expiresAt = new Date(Date.now() + WALLET_CHALLENGE_TTL_SECS * 1000).toISOString();
+
+    const redis = RedisClient.getInstance();
+    await redis.set(WALLET_CHALLENGE_KEY(req.userId!), challenge, "EX", WALLET_CHALLENGE_TTL_SECS);
+
+    res.json({ challenge, expires_at: expiresAt });
+  }),
+);
+
+/**
+ * POST /auth/wallet/verify
+ * Verifies an ed25519 signature over the active challenge, binds the Stellar
+ * address to the authenticated user, and re-issues a JWT that includes the
+ * walletAddress claim.
+ *
+ * Freighter's signMessage() signs raw UTF-8 bytes. LOBSTR may apply a
+ * different internal derivation — both produce an ed25519 signature that can
+ * be verified with Keypair.verify(rawMessageBytes, sigBytes).
+ */
+router.post(
+  "/wallet/verify",
+  authenticate,
+  validate({ body: walletVerifySchema }),
+  asyncHandler(async (req: AuthRequest, res: Response) => {
+    const { address, signature } = req.body as { address: string; signature: string };
+
+    const redis = RedisClient.getInstance();
+    const challengeKey = WALLET_CHALLENGE_KEY(req.userId!);
+    const challenge = await redis.get(challengeKey);
+
+    if (!challenge) {
+      return res.status(401).json({ error: "CHALLENGE_EXPIRED" });
+    }
+
+    let isValid = false;
+    try {
+      const keypair = Keypair.fromPublicKey(address);
+      isValid = keypair.verify(
+        Buffer.from(challenge, "utf8"),
+        Buffer.from(signature, "base64"),
+      );
+    } catch {
+      return res.status(401).json({ error: "INVALID_SIGNATURE" });
+    }
+
+    if (!isValid) {
+      return res.status(401).json({ error: "INVALID_SIGNATURE" });
+    }
+
+    // Ensure no other account already owns this address
+    const existing = await prisma.user.findUnique({ where: { walletAddress: address } });
+    if (existing && existing.id !== req.userId) {
+      return res.status(409).json({ error: "Wallet is already linked to another account." });
+    }
+
+    // Consume the nonce — one-time use
+    await redis.del(challengeKey);
+
+    const user = await prisma.user.update({
+      where: { id: req.userId },
+      data: { walletAddress: address },
+    });
+
+    // Issue a fresh access token that includes the verified walletAddress claim
+    const token = signAccessToken(user.id, user.tokenVersion, {
+      walletAddress: user.walletAddress,
+    });
+    const refreshRaw = await issueRefreshToken(user.id);
+    setRefreshCookie(res, refreshRaw);
+
+    res.json({ user: userPayload(user), token });
   }),
 );
 
@@ -586,9 +739,7 @@ router.post(
     if (/^\d{6}$/.test(code)) {
       const result = verifySync({ token: code, secret });
       if (result.valid) {
-        const token = jwt.sign({ userId: user.id }, config.jwtSecret, {
-          expiresIn: ACCESS_TOKEN_EXPIRY,
-        });
+        const token = signAccessToken(user.id, user.tokenVersion);
         const refreshRaw = await issueRefreshToken(user.id);
         setRefreshCookie(res, refreshRaw);
         return res.json({
@@ -617,9 +768,7 @@ router.post(
           data: { backupCodes: updatedCodes },
         });
 
-        const token = jwt.sign({ userId: user.id }, config.jwtSecret, {
-          expiresIn: ACCESS_TOKEN_EXPIRY,
-        });
+        const token = signAccessToken(user.id, user.tokenVersion);
         const refreshRaw = await issueRefreshToken(user.id);
         setRefreshCookie(res, refreshRaw);
         return res.json({
@@ -701,10 +850,102 @@ router.post(
         password: hashedPassword,
         passwordResetToken: null,
         passwordResetExpiry: null,
+        // Invalidate every JWT issued before this reset (issue #787).
+        tokenVersion: { increment: 1 },
       },
     });
+    
+    await prisma.refreshToken.updateMany({
+      where: { userId: user.id },
+      data: { revoked: true },
+    });
+    
+    await invalidateTokenVersionCache(user.id);
 
     res.json({ message: "Password has been reset successfully." });
+  }),
+);
+
+// Change password — authenticated, requires the current password. Increments
+// tokenVersion to invalidate all other sessions, then returns a fresh token so
+// the caller's current client stays signed in (issue #787).
+router.post(
+  "/change-password",
+  authenticate,
+  validate({ body: changePasswordSchema }),
+  asyncHandler(async (req: AuthRequest, res: Response) => {
+    const { currentPassword, newPassword } = req.body;
+
+    const user = await prisma.user.findUnique({ where: { id: req.userId } });
+    if (!user || !user.password) {
+      return res.status(400).json({ error: "Password change is not available for this account." });
+    }
+
+    const validPassword = await bcrypt.compare(currentPassword, user.password);
+    if (!validPassword) {
+      return res.status(401).json({ error: "Current password is incorrect." });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    const updated = await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        password: hashedPassword,
+        // Invalidate every JWT issued before this change (issue #787).
+        tokenVersion: { increment: 1 },
+      },
+      select: { id: true, tokenVersion: true },
+    });
+    
+    await prisma.refreshToken.updateMany({
+      where: { userId: user.id },
+      data: { revoked: true },
+    });
+    
+    await invalidateTokenVersionCache(user.id);
+
+    // Re-issue this session with the new tokenVersion so the caller is not
+    // logged out by the invalidation they just triggered.
+    const token = signAccessToken(updated.id, updated.tokenVersion);
+    const refreshRaw = await issueRefreshToken(user.id);
+    setRefreshCookie(res, refreshRaw);
+
+    res.json({ message: "Password changed successfully.", token });
+  }),
+);
+
+// Resend verification email — no session required. A freshly registered
+// user has no token yet (registration no longer auto-logs in), so this is
+// their only way to retry if the first send failed or the email is lost.
+// Always returns the same generic message to avoid leaking which emails
+// are registered, same as /forgot-password.
+router.post(
+  "/resend-verification",
+  forgotPasswordRateLimiter,
+  validate({ body: forgotPasswordSchema }),
+  asyncHandler(async (req: Request, res: Response) => {
+    const { email } = req.body;
+    const genericMessage = "If that email is registered and not yet verified, a new verification link has been sent.";
+
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user || user.emailVerified) {
+      return res.json({ message: genericMessage });
+    }
+
+    const rawToken = generateToken();
+    const hashed = hashToken(rawToken);
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { emailVerificationToken: hashed },
+    });
+
+    try {
+      await sendVerificationEmail(email, rawToken);
+    } catch (err) {
+      logger.error({ err, userId: user.id }, "Failed to resend verification email");
+    }
+
+    res.json({ message: genericMessage });
   }),
 );
 
@@ -733,7 +974,14 @@ router.post(
       data: { emailVerificationToken: hashed },
     });
 
-    await sendVerificationEmail(user.email, rawToken);
+    try {
+      await sendVerificationEmail(user.email, rawToken);
+    } catch (err) {
+      logger.error({ err, userId: user.id }, "Failed to send verification email on resend");
+      return res.status(502).json({
+        error: "Could not send verification email. Please try again shortly.",
+      });
+    }
 
     res.json({ message: "Verification email sent." });
   }),
@@ -757,7 +1005,7 @@ router.post(
 
     const user = await prisma.user.findUnique({
       where: { id: stored.userId },
-      select: { id: true, isSuspended: true },
+      select: { id: true, isSuspended: true, tokenVersion: true },
     });
 
     if (!user) {
@@ -768,9 +1016,7 @@ router.post(
       return res.status(403).json({ error: "Account suspended." });
     }
 
-    const token = jwt.sign({ userId: stored.userId }, config.jwtSecret, {
-      expiresIn: ACCESS_TOKEN_EXPIRY,
-    });
+    const token = signAccessToken(user.id, user.tokenVersion);
 
     res.json({ token });
   }),
@@ -811,7 +1057,7 @@ router.get(
       return res.status(400).json({ error: "Invalid verification token." });
     }
 
-    await prisma.user.update({
+    const verifiedUser = await prisma.user.update({
       where: { id: user.id },
       data: {
         emailVerified: true,
@@ -819,7 +1065,10 @@ router.get(
       },
     });
 
-    res.json({ message: "Email verified successfully." });
+    // Registration no longer logs the user in on its own — this is the step
+    // that actually establishes their first session, now that ownership of
+    // the email is proven.
+    await sendSession(res, verifiedUser);
   }),
 );
 

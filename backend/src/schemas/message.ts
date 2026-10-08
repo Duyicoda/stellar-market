@@ -13,8 +13,6 @@ export const updateMessageSchema = z.object({
 
 export const getMessagesQuerySchema = paginationSchema.extend({
   jobId: z.string().min(1).optional(),
-  senderId: z.string().min(1).optional(),
-  receiverId: z.string().min(1).optional(),
   participantId: z.string().min(1).optional(),
 });
 

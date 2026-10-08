@@ -1,5 +1,6 @@
 import { Router, Response } from "express";
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, Prisma } from "@prisma/client";
+import { z } from "zod";
 import { authenticate, AuthRequest } from "../middleware/auth";
 import { validate } from "../middleware/validation";
 import { asyncHandler } from "../middleware/error";
@@ -25,11 +26,11 @@ router.get(
   validate({ query: getServicesQuerySchema }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
     const { page, limit, search, category, minPrice, maxPrice, freelancerId } =
-      req.query as any;
+      req.query as unknown as z.infer<typeof getServicesQuerySchema>;
 
     const skip = (page - 1) * limit;
 
-    const where: any = {};
+    const where: Prisma.ServiceWhereInput = {};
 
     if (search) {
       where.OR = [
@@ -42,10 +43,10 @@ router.get(
       where.category = { equals: category, mode: "insensitive" };
     }
 
-    if (minPrice || maxPrice) {
+    if (minPrice !== undefined || maxPrice !== undefined) {
       where.price = {};
-      if (minPrice) where.price.gte = minPrice;
-      if (maxPrice) where.price.lte = maxPrice;
+      if (minPrice !== undefined) where.price.gte = minPrice;
+      if (maxPrice !== undefined) where.price.lte = maxPrice;
     }
 
     if (freelancerId) {

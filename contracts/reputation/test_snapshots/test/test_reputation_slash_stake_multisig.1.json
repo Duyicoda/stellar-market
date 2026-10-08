@@ -91,7 +91,7 @@
                   "map": [
                     {
                       "key": {
-                        "symbol": "last_updated_ledger"
+                        "symbol": "last_updated_ts"
                       },
                       "val": {
                         "u32": 0
@@ -135,7 +135,7 @@
             },
             "ext": "v0"
           },
-          4095
+          6311999
         ]
       ],
       [
@@ -340,7 +340,7 @@
             },
             "ext": "v0"
           },
-          4095
+          6311999
         ]
       ],
       [
@@ -394,7 +394,7 @@
             },
             "ext": "v0"
           },
-          4095
+          6311999
         ]
       ]
     ]
@@ -697,7 +697,7 @@
               "map": [
                 {
                   "key": {
-                    "symbol": "last_updated_ledger"
+                    "symbol": "last_updated_ts"
                   },
                   "val": {
                     "u32": 0

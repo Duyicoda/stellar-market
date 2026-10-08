@@ -33,22 +33,42 @@ jest.mock("../../socket", () => ({
   }),
 }));
 
+interface BatchedNotificationInput {
+  title: string;
+  message: string;
+  metadata: Record<string, unknown>;
+  timestamp: number;
+}
+
+interface NotificationServiceInternals {
+  batches: Map<string, { notifications: unknown[] }>;
+  MAX_BATCH_SIZE: number;
+  clearAllBatches: () => void;
+  createBatchedNotification: (
+    type: string,
+    notifications: BatchedNotificationInput[],
+  ) => { title: string; message: string; metadata: { type: string } };
+}
+
+const NotificationServiceInternal =
+  NotificationService as unknown as NotificationServiceInternals;
+
 describe.skip("NotificationService Batching", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     // Clear any existing batches
-    (NotificationService as any).batches.clear();
+    NotificationServiceInternal.batches.clear();
   });
 
   afterEach(async () => {
     // Clean up any pending batches
     await NotificationService.flushAllBatches();
-    (NotificationService as any).clearAllBatches();
+    NotificationServiceInternal.clearAllBatches();
   });
 
   it("should batch multiple similar notifications", async () => {
     const userId = "user1";
-    const type = NotificationType.MILESTONE_APPROVED as any;
+    const type = NotificationType.MILESTONE_APPROVED;
 
     // Send multiple notifications quickly
     await Promise.all([
@@ -73,10 +93,10 @@ describe.skip("NotificationService Batching", () => {
     ]);
 
     // Check that batches are created
-    const batches = (NotificationService as any).batches;
+    const batches = NotificationServiceInternal.batches;
     const batchKey = `${userId}:${type}`;
     expect(batches.has(batchKey)).toBe(true);
-    expect(batches.get(batchKey).notifications).toHaveLength(3);
+    expect(batches.get(batchKey)!.notifications).toHaveLength(3);
 
     // Flush batches and verify combined notification
     await NotificationService.flushAllBatches();
@@ -85,7 +105,7 @@ describe.skip("NotificationService Batching", () => {
 
   it("should not batch urgent notifications", async () => {
     const userId = "user1";
-    const type = NotificationType.DISPUTE_RAISED as any;
+    const type = NotificationType.DISPUTE_RAISED;
 
     // Send urgent notification
     const result = await NotificationService.sendNotification({
@@ -98,13 +118,13 @@ describe.skip("NotificationService Batching", () => {
     // Should be sent immediately, not batched
     expect(result).toBeTruthy();
 
-    const batches = (NotificationService as any).batches;
+    const batches = NotificationServiceInternal.batches;
     expect(batches.size).toBe(0);
   });
 
   it("should skip batching when explicitly requested", async () => {
     const userId = "user1";
-    const type = NotificationType.MILESTONE_APPROVED as any;
+    const type = NotificationType.MILESTONE_APPROVED;
 
     // Send notification with skipBatching flag
     const result = await NotificationService.sendNotification({
@@ -118,14 +138,14 @@ describe.skip("NotificationService Batching", () => {
     // Should be sent immediately
     expect(result).toBeTruthy();
 
-    const batches = (NotificationService as any).batches;
+    const batches = NotificationServiceInternal.batches;
     expect(batches.size).toBe(0);
   });
 
   it("should flush batch when max size is reached", async () => {
     const userId = "user1";
-    const type = NotificationType.APPLICATION_REJECTED as any;
-    const maxBatchSize = (NotificationService as any).MAX_BATCH_SIZE;
+    const type = NotificationType.APPLICATION_REJECTED;
+    const maxBatchSize = NotificationServiceInternal.MAX_BATCH_SIZE;
 
     // Send more notifications than max batch size
     const promises = [];
@@ -143,18 +163,18 @@ describe.skip("NotificationService Batching", () => {
     await Promise.all(promises);
 
     // Batch should have been flushed automatically
-    const batches = (NotificationService as any).batches;
+    const batches = NotificationServiceInternal.batches;
     const batchKey = `${userId}:${type}`;
 
     // Should either be empty (flushed) or have only 1 notification (the overflow)
     if (batches.has(batchKey)) {
-      expect(batches.get(batchKey).notifications.length).toBeLessThanOrEqual(1);
+      expect(batches.get(batchKey)!.notifications.length).toBeLessThanOrEqual(1);
     }
   });
 
   it("should create appropriate batched messages for different notification types", () => {
-    const createBatchedNotification = (NotificationService as any)
-      .createBatchedNotification;
+    const createBatchedNotification =
+      NotificationServiceInternal.createBatchedNotification;
 
     const milestoneNotifications = [
       {

@@ -7,7 +7,8 @@ export default function Footer() {
         <div className="grid grid-cols-1 md:grid-cols-4 gap-8">
           <div>
             <div className="flex items-center gap-2 mb-4">
-              <div className="w-8 h-8 bg-gradient-to-br from-stellar-blue to-stellar-purple rounded-lg" />
+              {/* eslint-disable-next-line @next/next/no-img-element -- next/image blocks local SVGs without dangerouslyAllowSVG */}
+              <img src="/favicon.svg" alt="StellarMarket" width={32} height={32} className="w-8 h-8" />
               <span className="text-lg font-bold text-theme-heading">
                 StellarMarket
               </span>

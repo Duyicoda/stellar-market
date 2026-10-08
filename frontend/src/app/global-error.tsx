@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect } from "react";
 import { AlertTriangle, RefreshCw } from "lucide-react";
 import { logError } from "@/utils/errorLogger";
 
@@ -10,7 +11,9 @@ export default function GlobalError({
   error: Error & { digest?: string };
   reset: () => void;
 }) {
-  logError(error, "global");
+  useEffect(() => {
+    logError(error, "global");
+  }, [error]);
 
   return (
     <html>

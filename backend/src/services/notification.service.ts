@@ -1,8 +1,13 @@
-import { PrismaClient, NotificationType } from "@prisma/client";
+import { PrismaClient, Prisma, NotificationType } from "@prisma/client";
 import { getIo } from "../socket";
 import { EmailService } from "./email.service";
 import { config } from "../config";
 import { logger } from "../lib/logger";
+import webpush, { WebPushError } from "web-push";
+import {
+  notificationQueue,
+  getNotificationPriority,
+} from "../lib/notification-queue";
 
 const prisma = new PrismaClient();
 
@@ -11,7 +16,7 @@ interface BatchedNotification {
   type: NotificationType;
   title: string;
   message: string;
-  metadata?: any;
+  metadata?: Record<string, unknown>;
   timestamp: number;
 }
 
@@ -26,6 +31,17 @@ export class NotificationService {
   private static batches = new Map<string, NotificationBatch>();
   private static readonly BATCH_WINDOW_MS = 5000; // 5 seconds
   private static readonly MAX_BATCH_SIZE = 10;
+  private static readonly PUSH_ENABLED_TYPES: NotificationType[] = [
+    "JOB_APPLIED",
+    "APPLICATION_ACCEPTED",
+    "APPLICATION_REJECTED",
+    "MILESTONE_SUBMITTED",
+    "MILESTONE_APPROVED",
+    "DISPUTE_RAISED",
+    "DISPUTE_RESOLVED",
+    "NEW_MESSAGE",
+    "PAYMENT_RELEASED",
+  ];
 
   /**
    * Creates a notification in the database and sends it in real-time via Socket.IO.
@@ -35,7 +51,7 @@ export class NotificationService {
     type: NotificationType;
     title: string;
     message: string;
-    metadata?: any;
+    metadata?: Record<string, unknown>;
     skipBatching?: boolean; // Allow bypassing batching for urgent notifications
   }) {
     const {
@@ -52,6 +68,7 @@ export class NotificationService {
       const urgentTypes: NotificationType[] = [
         "DISPUTE_RAISED",
         "DISPUTE_RESOLVED",
+        "SUSPICIOUS_REPORTER_FLAGGED",
       ];
 
       if (skipBatching || urgentTypes.includes(type)) {
@@ -82,18 +99,18 @@ export class NotificationService {
   }
 
   /**
-   * Sends a notification immediately without batching
+   * Persists the notification to the DB and enqueues it for priority-ordered socket delivery.
+   * Callers get back the saved record immediately; socket emit happens asynchronously via the worker.
    */
   private static async sendImmediateNotification(params: {
     userId: string;
     type: NotificationType;
     title: string;
     message: string;
-    metadata?: any;
+    metadata?: Record<string, unknown>;
   }) {
     const { userId, type, title, message, metadata } = params;
 
-    // 1. Create DB record (ensure commit before emitting)
     const notification = await prisma.$transaction(async (tx) => {
       return await tx.notification.create({
         data: {
@@ -101,24 +118,38 @@ export class NotificationService {
           type,
           title,
           message,
-          metadata: metadata || {},
+          metadata: (metadata || {}) as Prisma.InputJsonValue,
         },
       });
     });
 
-    void this.maybeSendEmailForNotification({
-      userId,
-      type,
-      title,
-      message,
-      metadata: metadata || {},
-    });
+    const priority = getNotificationPriority(type);
+    await notificationQueue.add(
+      "send",
+      {
+        userId,
+        type,
+        title,
+        message,
+        metadata: metadata || {},
+        notificationId: notification.id,
+        priority,
+      },
+      { priority },
+    );
 
-    // 2. Emit real-time event via Socket.IO
-    const io = getIo();
-    io.to(`user:${userId}`).emit("notification:new", notification);
+    logger.info({ userId, type, title, notificationId: notification.id }, "Notification enqueued");
 
-    logger.info({ userId, type, title }, "Notification sent");
+    if (this.PUSH_ENABLED_TYPES.includes(type)) {
+      await this.sendPushNotification(userId, {
+        title,
+        body: message,
+        icon: "/icon-192.png",
+        badge: "/favicon.svg",
+        data: { notificationId: notification.id, type, metadata },
+      });
+    }
+
     return notification;
   }
 
@@ -214,7 +245,7 @@ export class NotificationService {
   private static createBatchedNotification(
     type: NotificationType,
     notifications: BatchedNotification[],
-  ): { title: string; message: string; metadata: any } {
+  ): { title: string; message: string; metadata: Record<string, unknown> } {
     const count = notifications.length;
 
     switch (type) {
@@ -280,12 +311,12 @@ export class NotificationService {
     this.batches.clear();
   }
 
-  private static async maybeSendEmailForNotification(params: {
+  static async deliverExternalNotification(params: {
     userId: string;
     type: NotificationType;
     title: string;
     message: string;
-    metadata: any;
+    metadata: Record<string, unknown>;
   }): Promise<void> {
     const { userId, type, title, message, metadata } = params;
 
@@ -316,6 +347,8 @@ export class NotificationService {
           return pref?.emailPaymentReleased ?? true;
         case "APPLICATION_ACCEPTED":
           return pref?.emailApplicationAccepted ?? true;
+        case "SUSPICIOUS_REPORTER_FLAGGED":
+          return true; // Always send to admins
         default:
           return false;
       }
@@ -340,6 +373,8 @@ export class NotificationService {
           return "payment.released" as const;
         case "APPLICATION_ACCEPTED":
           return "application.accepted" as const;
+        case "SUSPICIOUS_REPORTER_FLAGGED":
+          return "suspicious-reporter.flagged" as const;
         default:
           return null;
       }
@@ -347,21 +382,18 @@ export class NotificationService {
 
     if (!event) return;
 
-    try {
-      await EmailService.sendEventEmail({
-        to: email,
-        event,
-        title,
-        message,
-        outcome: metadata?.outcome,
-        actionUrl,
-      });
-    } catch (error) {
-      logger.error(
-        { err: error, userId, type },
-        "Failed to send notification email",
-      );
-    }
+    const unsubscribeUrl = EmailService.buildUnsubscribeUrl(userId);
+
+    // Do not catch the error, let it propagate so the worker fails and retries
+    await EmailService.sendEventEmail({
+      to: email,
+      event,
+      title,
+      message,
+      outcome: typeof metadata?.outcome === "string" ? metadata.outcome : undefined,
+      actionUrl,
+      unsubscribeUrl,
+    });
   }
 
   /**
@@ -464,4 +496,146 @@ export class NotificationService {
   static async deleteAllRead(userId: string) {
     return prisma.notification.deleteMany({ where: { userId, read: true } });
   }
+
+  /**
+   * Subscribe a user to push notifications
+   */
+  static async subscribeToPush(
+    userId: string,
+    subscription: {
+      endpoint: string;
+      p256dh: string;
+      auth: string;
+    },
+  ) {
+    try {
+      // Check if subscription already exists
+      const existing = await prisma.pushSubscription.findUnique({
+        where: { endpoint: subscription.endpoint },
+      });
+
+      if (existing) {
+        // Update if it belongs to a different user
+        if (existing.userId !== userId) {
+          await prisma.pushSubscription.update({
+            where: { endpoint: subscription.endpoint },
+            data: {
+              userId,
+              p256dh: subscription.p256dh,
+              auth: subscription.auth,
+            },
+          });
+        }
+      } else {
+        // Create new subscription
+        await prisma.pushSubscription.create({
+          data: {
+            userId,
+            endpoint: subscription.endpoint,
+            p256dh: subscription.p256dh,
+            auth: subscription.auth,
+          },
+        });
+      }
+
+      logger.info({ userId }, "User subscribed to push notifications");
+    } catch (error) {
+      logger.error({ err: error, userId }, "Error subscribing to push notifications");
+      throw error;
+    }
+  }
+
+  /**
+   * Unsubscribe a user from push notifications
+   */
+  static async unsubscribeFromPush(userId: string, endpoint: string) {
+    try {
+      await prisma.pushSubscription.deleteMany({
+        where: {
+          userId,
+          endpoint,
+        },
+      });
+
+      logger.info({ userId, endpoint }, "User unsubscribed from push notifications");
+    } catch (error) {
+      logger.error({ err: error, userId }, "Error unsubscribing from push notifications");
+      throw error;
+    }
+  }
+
+  /**
+   * Send push notification to a user
+   */
+  private static async sendPushNotification(
+    userId: string,
+    payload: {
+      title: string;
+      body: string;
+      icon?: string;
+      badge?: string;
+      data?: Record<string, unknown>;
+    },
+  ) {
+    try {
+      // Configure web-push with VAPID details
+      const vapidPublicKey = config.vapidPublicKey;
+      const vapidPrivateKey = config.vapidPrivateKey;
+      const vapidSubject = config.vapidSubject || `mailto:admin@stellarmarket.io`;
+
+      if (!vapidPublicKey || !vapidPrivateKey) {
+        logger.warn("VAPID keys not configured, skipping push notification");
+        return;
+      }
+
+      webpush.setVapidDetails(vapidSubject, vapidPublicKey, vapidPrivateKey);
+
+      // Get all push subscriptions for the user
+      const subscriptions = await prisma.pushSubscription.findMany({
+        where: { userId },
+      });
+
+      if (subscriptions.length === 0) {
+        return;
+      }
+
+      // Send to all subscriptions
+      const results = await Promise.allSettled(
+        subscriptions.map(async (sub) => {
+          try {
+            await webpush.sendNotification(
+              {
+                endpoint: sub.endpoint,
+                keys: {
+                  p256dh: sub.p256dh,
+                  auth: sub.auth,
+                },
+              },
+              JSON.stringify(payload),
+            );
+          } catch (error) {
+            // Remove invalid subscriptions
+            if (error instanceof WebPushError && (error.statusCode === 410 || error.statusCode === 404)) {
+              await prisma.pushSubscription.delete({
+                where: { id: sub.id },
+              });
+              logger.info({ subscriptionId: sub.id }, "Removed invalid push subscription");
+            } else {
+              throw error;
+            }
+          }
+        }),
+      );
+
+      const successCount = results.filter((r) => r.status === "fulfilled").length;
+      logger.info(
+        { userId, successCount, totalSubscriptions: subscriptions.length },
+        "Push notifications sent",
+      );
+    } catch (error) {
+      logger.error({ err: error, userId }, "Error sending push notification");
+    }
+  }
+
 }
+

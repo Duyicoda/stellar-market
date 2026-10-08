@@ -1,7 +1,8 @@
 "use client";
 
 import { useState, useCallback, useEffect, useRef } from "react";
-import { X, Loader2, AlertCircle } from "lucide-react";
+import { X, Loader2, AlertCircle, Wallet } from "lucide-react";
+import Link from "next/link";
 import dynamic from "next/dynamic";
 import axios from "axios";
 import { useAuth } from "@/context/AuthContext";
@@ -11,7 +12,7 @@ import { Job } from "@/types";
 
 const MDEditor = dynamic(() => import("@uiw/react-md-editor"), { ssr: false });
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5000/api";
+const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5000/api/v1";
 
 const TIMELINE_OPTIONS = [
   { label: "1 week", days: 7 },
@@ -21,8 +22,9 @@ const TIMELINE_OPTIONS = [
   { label: "Custom", days: 0 },
 ];
 
-const MIN_PROPOSAL_LENGTH = 100;
-const MAX_PROPOSAL_LENGTH = 1000;
+const MIN_PROPOSAL_LENGTH = 20;
+const MAX_PROPOSAL_LENGTH = 2000;
+const PROPOSAL_WARN_THRESHOLD = 1800;
 
 interface ApplyModalProps {
   job: Job;
@@ -49,6 +51,7 @@ export default function ApplyModal({
   const [customDays, setCustomDays] = useState<number | "">("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  const [walletRequired, setWalletRequired] = useState(false);
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
 
   useEffect(() => {
@@ -59,6 +62,7 @@ export default function ApplyModal({
       setCustomDays("");
       setError("");
       setValidationErrors({});
+      setWalletRequired(false);
     }
   }, [isOpen, job.budget]);
 
@@ -75,9 +79,9 @@ export default function ApplyModal({
     if (!proposal.trim()) {
       errors.proposal = "Cover letter is required.";
     } else if (plainText.length < MIN_PROPOSAL_LENGTH) {
-      errors.proposal = `Proposal must be at least ${MIN_PROPOSAL_LENGTH} characters.`;
+      errors.proposal = `Cover letter must be at least ${MIN_PROPOSAL_LENGTH} characters.`;
     } else if (plainText.length > MAX_PROPOSAL_LENGTH) {
-      errors.proposal = `Proposal must be less than ${MAX_PROPOSAL_LENGTH} characters.`;
+      errors.proposal = `Cover letter must be less than ${MAX_PROPOSAL_LENGTH} characters.`;
     }
 
     if (!bidAmount || bidAmount <= 0) {
@@ -123,8 +127,15 @@ export default function ApplyModal({
       onSuccess();
       onClose();
     } catch (err: unknown) {
-      if (axios.isAxiosError(err) && err.response?.data?.error) {
-        setError(err.response.data.error);
+      if (axios.isAxiosError(err)) {
+        const data = err.response?.data;
+        if (data?.code === "WalletRequired") {
+          setWalletRequired(true);
+        } else if (data?.error) {
+          setError(data.error);
+        } else {
+          setError("Something went wrong. Please try again.");
+        }
       } else {
         setError("Something went wrong. Please try again.");
       }
@@ -173,6 +184,21 @@ export default function ApplyModal({
           {job.title} &mdash; {job.budget.toLocaleString()} XLM
         </p>
 
+        {walletRequired && (
+          <div className="flex items-start gap-3 p-4 mb-4 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-600 dark:text-amber-400 text-sm">
+            <Wallet size={16} className="shrink-0 mt-0.5" />
+            <span>
+              Connect your Freighter wallet to apply.{" "}
+              <Link
+                href="/settings/wallet"
+                className="underline font-medium hover:opacity-80"
+              >
+                Go to wallet settings
+              </Link>
+            </span>
+          </div>
+        )}
+
         {error && (
           <div className="flex items-center gap-2 p-3 mb-4 rounded-lg bg-theme-error/10 border border-theme-error/30 text-theme-error text-sm">
             <AlertCircle size={16} className="shrink-0" />
@@ -204,11 +230,16 @@ export default function ApplyModal({
                 </span>
               )}
               <span
-                className={`text-xs ${
-                  plainTextLength < MIN_PROPOSAL_LENGTH || plainTextLength > MAX_PROPOSAL_LENGTH
+                className={`text-xs tabular-nums ${
+                  plainTextLength > MAX_PROPOSAL_LENGTH
                     ? "text-theme-error"
-                    : "text-theme-success"
+                    : plainTextLength >= PROPOSAL_WARN_THRESHOLD
+                    ? "text-yellow-500"
+                    : plainTextLength >= MIN_PROPOSAL_LENGTH
+                    ? "text-theme-success"
+                    : "text-theme-error"
                 }`}
+                aria-live="polite"
               >
                 {plainTextLength} / {MAX_PROPOSAL_LENGTH}
               </span>

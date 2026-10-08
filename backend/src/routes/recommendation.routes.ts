@@ -1,4 +1,5 @@
 import { Router, Response } from "express";
+import { z } from "zod";
 import { authenticate, AuthRequest } from "../middleware/auth";
 import { validate } from "../middleware/validation";
 import { asyncHandler } from "../middleware/error";
@@ -13,7 +14,9 @@ router.get(
   authenticate,
   validate({ query: getRecommendationsQuerySchema }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { page, limit } = req.query as any;
+    const { page, limit } = req.query as unknown as z.infer<
+      typeof getRecommendationsQuerySchema
+    >;
 
     const result = await RecommendationService.getRecommendedJobs(
       req.userId!,

@@ -1,16 +1,27 @@
 import { Router, Response } from "express";
-import { PrismaClient } from "@prisma/client";
-import { authenticate, AuthRequest } from "../middleware/auth";
+import { PrismaClient, Prisma, JobStatus } from "@prisma/client";
+import { z } from "zod";
+import { authenticate, optionalAuthenticate, AuthRequest } from "../middleware/auth";
 import { validate } from "../middleware/validation";
 import { asyncHandler } from "../middleware/error";
+import { AppError } from "../errors/AppError";
+import { ErrorCodes } from "../errors/codes";
+import { logger } from "../lib/logger";
 import { RecommendationQueueService } from "../services/recommendation-queue.service";
+import { FraudDetectionService } from "../services/fraud-detection.service";
 import {
   createJobSchema,
+  createJobWithMilestonesSchema,
   updateJobSchema,
   getJobsQuerySchema,
   getJobByIdParamSchema,
   updateJobStatusSchema,
   getSavedJobsQuerySchema,
+  publicJobListResponseSchema,
+  authenticatedJobListResponseSchema,
+  publicSingleJobResponseSchema,
+  authenticatedSingleJobResponseSchema,
+  ownerSingleJobResponseSchema,
 } from "../schemas";
 import { paginationSchema } from "../schemas/common";
 import {
@@ -25,8 +36,167 @@ import {
   ContractService,
   RevisionProposalView,
 } from "../services/contract.service";
+import { MAX_PAGE_SIZE, config } from "../config";
+import { JOB_CATEGORIES } from "../constants/categories";
 
 const router = Router();
+
+const VALID_CATEGORIES = JOB_CATEGORIES;
+
+function isValidCategory(value: string): boolean {
+  return VALID_CATEGORIES.some(
+    (c) => c.toLowerCase() === value.trim().toLowerCase(),
+  );
+}
+
+const JOB_LIST_SELECT = {
+  id: true, title: true, description: true, budget: true, status: true,
+  category: true, createdAt: true, skills: true, deadline: true,
+  escrowStatus: true, clientId: true, freelancerId: true, updatedAt: true,
+  client: { select: { id: true, username: true, avatarUrl: true, walletAddress: true } },
+  freelancer: { select: { id: true, username: true, avatarUrl: true } },
+  _count: { select: { applications: true } },
+} satisfies Prisma.JobSelect;
+
+type JobListItem = Prisma.JobGetPayload<{ select: typeof JOB_LIST_SELECT }>;
+
+interface JobListPagination {
+  total: number;
+  page: number | null;
+  limit: number;
+  totalPages?: number;
+  hasNext: boolean;
+  nextCursor?: string | null;
+}
+
+// ─── Field projection helpers ─────────────────────────────────────────────────
+
+/** Strip private client fields for unauthenticated callers. */
+function toPublicJob(job: JobListItem) {
+  const { client, ...rest } = job;
+  return {
+    id: rest.id,
+    title: rest.title,
+    description: rest.description,
+    budget: rest.budget,
+    category: rest.category,
+    createdAt: rest.createdAt,
+    client: {
+      id: client.id,
+      username: client.username,
+      avatarUrl: client.avatarUrl ?? null,
+    },
+  };
+}
+
+/** Strip client.email (never sent); keep walletAddress for authenticated users. */
+function toAuthenticatedJob(job: JobListItem) {
+  // JOB_LIST_SELECT never selects `client.email`, so there is nothing to
+  // strip here — `client` is already safe to return as-is.
+  return job;
+}
+
+/**
+ * Apply the correct field projection before sending a job list response.
+ * Validates the final shape with the matching Zod schema and throws if
+ * validation fails (this catches accidental future field additions).
+ */
+function projectAndValidateList(
+  jobs: JobListItem[],
+  pagination: JobListPagination,
+  isAuthenticated: boolean,
+  res: Response,
+) {
+  if (!isAuthenticated) {
+    const payload = { data: jobs.map(toPublicJob), pagination };
+    const parsed = publicJobListResponseSchema.parse(payload);
+    return res.json(parsed);
+  }
+  const payload = { data: jobs.map(toAuthenticatedJob), pagination };
+  const parsed = authenticatedJobListResponseSchema.parse(payload);
+  return res.json(parsed);
+}
+
+const JOB_DETAIL_INCLUDE = {
+  client: {
+    select: { id: true, username: true, avatarUrl: true, bio: true, walletAddress: true },
+  },
+  freelancer: {
+    select: { id: true, username: true, avatarUrl: true, bio: true },
+  },
+  milestones: { orderBy: { order: "asc" as const } },
+  applications: {
+    include: {
+      freelancer: {
+        select: { id: true, username: true, avatarUrl: true },
+      },
+    },
+  },
+} satisfies Prisma.JobInclude;
+
+type JobDetail = Prisma.JobGetPayload<{ include: typeof JOB_DETAIL_INCLUDE }>;
+
+/**
+ * Extra fields merged onto a JobDetail before sending a single-job response
+ * (on-chain escrow status/revision data resolved outside the DB query, plus
+ * whether the requesting freelancer has saved this job).
+ */
+interface JobDetailExtra {
+  escrow_status: string;
+  escrowStatus: string;
+  revisionProposal: RevisionProposalView | null;
+  isSaved: boolean;
+}
+
+/**
+ * Apply the correct field projection before sending a single-job response.
+ * Three tiers: public / authenticated-non-owner / owner.
+ */
+function projectAndValidateSingle(
+  job: JobDetail,
+  extra: JobDetailExtra,
+  requestUserId: string | undefined,
+  res: Response,
+) {
+  const merged = { ...job, ...extra };
+
+  // Unauthenticated
+  if (!requestUserId) {
+    const { client, ...rest } = merged;
+    const publicPayload = {
+      id: rest.id,
+      title: rest.title,
+      description: rest.description,
+      budget: rest.budget,
+      category: rest.category,
+      createdAt: rest.createdAt,
+      client: { id: client.id, username: client.username, avatarUrl: client.avatarUrl ?? null },
+      milestones: rest.milestones,
+      isSaved: rest.isSaved,
+      escrow_status: rest.escrow_status,
+      escrowStatus: rest.escrowStatus,
+      revisionProposal: rest.revisionProposal,
+    };
+    const parsed = publicSingleJobResponseSchema.parse(publicPayload);
+    return res.json(parsed);
+  }
+
+  // Authenticated — client select never includes `email`, so there is
+  // nothing to strip here (kept structurally identical to the public branch).
+  const { client, ...rest } = merged;
+  const authPayload = { ...rest, client };
+
+  // Owner gets the full authenticated record (no extra gating needed beyond
+  // email removal, which is already applied above)
+  if (rest.clientId === requestUserId) {
+    const parsed = ownerSingleJobResponseSchema.parse(authPayload);
+    return res.json(parsed);
+  }
+
+  const parsed = authenticatedSingleJobResponseSchema.parse(authPayload);
+  return res.json(parsed);
+}
+
 /**
  * @swagger
  * tags:
@@ -128,8 +298,24 @@ router.get(
    *               $ref: '#/components/schemas/ErrorResponse'
    */
   validate({ query: getJobsQuerySchema }),
+  optionalAuthenticate,
   asyncHandler(async (req: AuthRequest, res: Response) => {
-  const { page = 1, limit = 20, search, category, skill, skills, status, minBudget, maxBudget, clientId, token, sort, postedAfter, cursor } = (req as any).query;
+    const {
+      page = 1,
+      limit = 20,
+      search,
+      category,
+      skill,
+      skills,
+      status,
+      minBudget,
+      maxBudget,
+      clientId,
+      token,
+      sort,
+      postedAfter,
+      cursor,
+    } = req.query as unknown as z.infer<typeof getJobsQuerySchema>;
     // Ensure limit is within bounds
     const safeLimit = Math.min(Math.max(1, Number(limit)), 100);
     const safePage = Math.max(1, Number(page));
@@ -152,7 +338,7 @@ router.get(
     });
 
     const { data, hit } = await cache(cacheKey, 30, async () => {
-      const where: any = {};
+      const where: Prisma.JobWhereInput = { deletedAt: null };
 
       // Full-text search using PostgreSQL tsvector/tsquery with relevance ranking.
       // Falls back to Prisma contains (LIKE) if raw query fails.
@@ -202,7 +388,9 @@ router.get(
       }
 
       if (category) {
-        where.category = { equals: category, mode: "insensitive" };
+        // Accept slug form (e.g. "smart-contract") or canonical form ("Smart Contract").
+        const normalised = (category as string).replace(/-/g, " ");
+        where.category = { equals: normalised, mode: "insensitive" };
       }
 
       if (status) {
@@ -210,9 +398,11 @@ router.get(
           .split(",")
           .map((s: string) => s.trim());
         if (statusList.length === 1) {
-          where.status = statusList[0];
+          // Query-param values are expected to match JobStatus but aren't
+          // validated ahead of time — Prisma enforces the enum at query time.
+          where.status = statusList[0] as JobStatus;
         } else {
-          where.status = { in: statusList };
+          where.status = { in: statusList as JobStatus[] };
         }
       }
 
@@ -226,9 +416,12 @@ router.get(
         where.clientId = clientId;
       }
 
-      // Filter by payment token (e.g. ?token=XLM)
+      // Filter by payment token (e.g. ?token=XLM).
       if (token) {
-        where.paymentToken = { equals: token, mode: "insensitive" };
+        where.paymentToken = {
+          equals: token,
+          mode: "insensitive",
+        };
       }
 
       if (postedAfter) {
@@ -236,7 +429,9 @@ router.get(
       }
 
       // Resolve sort — supports legacy names and new aliases
-      const resolveOrderBy = (sortParam: string | undefined): any => {
+      const resolveOrderBy = (
+        sortParam: string | undefined,
+      ): Prisma.JobOrderByWithRelationInput => {
         switch (sortParam) {
           case "oldest":
             return { createdAt: "asc" };
@@ -308,26 +503,19 @@ router.get(
                 ],
               };
 
-        const paginatedWhere: any = { ...where };
+        const paginatedWhere: Prisma.JobWhereInput = { ...where };
         paginatedWhere.AND = Array.isArray(where.AND)
           ? [...where.AND, cursorClause]
           : [cursorClause];
 
-        const orderBy: any = [
+        const orderBy: Prisma.JobOrderByWithRelationInput[] = [
           { createdAt: sortDirection },
           { id: sortDirection },
         ];
 
         const jobs = await prisma.job.findMany({
           where: paginatedWhere,
-          include: {
-            client: { select: { id: true, username: true, avatarUrl: true } },
-            freelancer: {
-              select: { id: true, username: true, avatarUrl: true },
-            },
-            milestones: true,
-            _count: { select: { applications: true } },
-          },
+          select: JOB_LIST_SELECT,
           orderBy,
           take: safeLimit + 1,
         });
@@ -366,14 +554,7 @@ router.get(
       const [jobs, total] = await Promise.all([
         prisma.job.findMany({
           where,
-          include: {
-            client: { select: { id: true, username: true, avatarUrl: true } },
-            freelancer: {
-              select: { id: true, username: true, avatarUrl: true },
-            },
-            milestones: true,
-            _count: { select: { applications: true } },
-          },
+          select: JOB_LIST_SELECT,
           orderBy,
           skip,
           take: safeLimit,
@@ -404,7 +585,8 @@ router.get(
     });
 
     res.set("X-Cache-Hit", hit.toString());
-    res.json(data);
+    res.setHeader("X-Max-Page-Size", String(MAX_PAGE_SIZE));
+    return projectAndValidateList(data.data, data.pagination, !!req.userId, res);
   }),
 );
 
@@ -414,31 +596,28 @@ router.get(
   authenticate,
   validate({ query: paginationSchema }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { page = 1, limit = 20, status } = req.query as any;
+    const { page = 1, limit = 20, status } = req.query as unknown as z.infer<
+      typeof paginationSchema
+    > & { status?: string };
 
     // Ensure limit is within bounds
     const safeLimit = Math.min(Math.max(1, Number(limit)), 100);
     const safePage = Math.max(1, Number(page));
     const skip = (safePage - 1) * safeLimit;
 
-    const where: any = {
+    const where: Prisma.JobWhereInput = {
       OR: [{ clientId: req.userId }, { freelancerId: req.userId }],
       deletedAt: null,
     };
-    if (status) where.status = status;
+    if (status) where.status = status as JobStatus;
 
     const [jobs, total] = await Promise.all([
       prisma.job.findMany({
         where,
+        select: JOB_LIST_SELECT,
         skip,
         take: safeLimit,
         orderBy: { createdAt: "desc" },
-        include: {
-          client: { select: { id: true, username: true, avatarUrl: true } },
-          freelancer: { select: { id: true, username: true, avatarUrl: true } },
-          milestones: true,
-          _count: { select: { applications: true } },
-        },
       }),
       prisma.job.count({ where }),
     ]);
@@ -446,6 +625,7 @@ router.get(
     const totalPages = Math.ceil(total / safeLimit);
     const hasNext = safePage < totalPages;
 
+    res.setHeader("X-Max-Page-Size", String(MAX_PAGE_SIZE));
     res.json({
       data: jobs,
       pagination: {
@@ -471,9 +651,7 @@ router.get(
     });
 
     if (!user || user.role !== "FREELANCER") {
-      return res
-        .status(403)
-        .json({ error: "Only freelancers can view saved jobs." });
+      throw new AppError(ErrorCodes.FORBIDDEN, "Only freelancers can view saved jobs.", 403);
     }
 
     const {
@@ -484,14 +662,14 @@ router.get(
       skill,
       minBudget,
       maxBudget,
-    } = req.query as any;
+    } = req.query as unknown as z.infer<typeof getSavedJobsQuerySchema>;
 
     // Ensure limit is within bounds
     const safeLimit = Math.min(Math.max(1, Number(limit)), 100);
     const safePage = Math.max(1, Number(page));
     const skip = (safePage - 1) * safeLimit;
 
-    const jobWhere: any = {
+    const jobWhere: Prisma.JobWhereInput = {
       status: "OPEN",
       deletedAt: null,
     };
@@ -517,7 +695,7 @@ router.get(
       if (maxBudget) jobWhere.budget.lte = Number(maxBudget);
     }
 
-    const savedJobWhere: any = {
+    const savedJobWhere: Prisma.SavedJobWhereInput = {
       freelancerId: req.userId,
       job: jobWhere,
     };
@@ -525,14 +703,10 @@ router.get(
     const [savedJobs, total] = await Promise.all([
       prisma.savedJob.findMany({
         where: savedJobWhere,
-        include: {
-          job: {
-            include: {
-              client: { select: { id: true, username: true, avatarUrl: true } },
-              milestones: true,
-              _count: { select: { applications: true } },
-            },
-          },
+        select: {
+          jobId: true,
+          createdAt: true,
+          job: { select: JOB_LIST_SELECT },
         },
         orderBy: { createdAt: "desc" },
         skip,
@@ -566,50 +740,36 @@ router.get(
 );
 
 // Get a single job by ID
-	router.get(
-	  "/:id",
-	  validate({ params: getJobByIdParamSchema }),
-	  asyncHandler(async (req: AuthRequest, res: Response) => {
-	    const id = req.params.id as string;
-	    const job = await prisma.job.findFirst({
+router.get(
+  "/:id",
+  validate({ params: getJobByIdParamSchema }),
+  optionalAuthenticate,
+  asyncHandler(async (req: AuthRequest, res: Response) => {
+    const id = req.params.id as string;
+    const job = await prisma.job.findFirst({
       where: {
         id,
         deletedAt: null,
       },
-      include: {
-        client: {
-          select: { id: true, username: true, avatarUrl: true, bio: true },
-        },
-        freelancer: {
-          select: { id: true, username: true, avatarUrl: true, bio: true },
-        },
-        milestones: { orderBy: { order: "asc" } },
-        applications: {
-          include: {
-            freelancer: {
-              select: { id: true, username: true, avatarUrl: true },
-            },
-          },
-        },
-      },
+      include: JOB_DETAIL_INCLUDE,
     });
 
-	    if (!job) {
-	      return res.status(404).json({ error: "Job not found." });
-	    }
+    if (!job) {
+      throw new AppError(ErrorCodes.NOT_FOUND, "Job not found.", 404);
+    }
 
-	    const lastModified = (job as any).updatedAt ?? (job as any).createdAt;
-	    const etag = `W/"job:${id}:${new Date(lastModified).toISOString()}"`;
-	    res.setHeader("ETag", etag);
-	    res.setHeader("Last-Modified", new Date(lastModified).toUTCString());
-	    if (!req.userId && req.headers["if-none-match"] === etag) {
-	      return res.status(304).end();
-	    }
+    const lastModified = job.updatedAt ?? job.createdAt;
+    const etag = `W/"job:${id}:${new Date(lastModified).toISOString()}"`;
+    res.setHeader("ETag", etag);
+    res.setHeader("Last-Modified", new Date(lastModified).toUTCString());
+    if (!req.userId && req.headers["if-none-match"] === etag) {
+      return res.status(304).end();
+    }
 
-	    let isSaved = false;
-	    if (req.userId) {
-	      const user = await prisma.user.findUnique({
-	        where: { id: req.userId },
+    let isSaved = false;
+    if (req.userId) {
+      const user = await prisma.user.findUnique({
+        where: { id: req.userId },
         select: { role: true },
       });
 
@@ -637,9 +797,9 @@ router.get(
         });
         escrowStatus = onChainStatus;
       } catch (error) {
-        console.warn(
+        logger.warn(
+          { err: error, jobId: id },
           `Could not fetch on-chain status for job ${id}, falling back to DB:`,
-          error,
         );
       }
 
@@ -647,17 +807,21 @@ router.get(
         const p = await ContractService.getRevisionProposal(job.contractJobId);
         revisionProposal = p && p.status === "PENDING" ? p : null;
       } catch (error) {
-        console.warn(`Could not fetch revision proposal for job ${id}:`, error);
+        logger.warn({ err: error, jobId: id }, `Could not fetch revision proposal for job ${id}:`);
       }
     }
 
-    res.json({
-      ...job,
-      escrow_status: escrowStatus,
-      escrowStatus: escrowStatus,
-      revisionProposal,
-      isSaved,
-    });
+    return projectAndValidateSingle(
+      job,
+      {
+        escrow_status: escrowStatus,
+        escrowStatus: escrowStatus,
+        revisionProposal,
+        isSaved,
+      },
+      req.userId,
+      res,
+    );
   }),
 );
 
@@ -710,17 +874,25 @@ router.post(
     });
 
     if (!user || user.role !== "CLIENT") {
-      return res.status(403).json({ error: "Only clients can post jobs." });
+      throw new AppError(ErrorCodes.FORBIDDEN, "Only clients can post jobs.", 403);
     }
 
     const { title, description, budget, skills, deadline } = req.body;
+    const category = req.body.category as string | undefined;
+
+    if (category && !isValidCategory(category)) {
+      return res.status(422).json({
+        code: "InvalidCategory",
+        message: `"${category}" is not a recognised category. Valid categories: ${VALID_CATEGORIES.join(", ")}.`,
+      });
+    }
 
     const job = await prisma.job.create({
       data: {
         title,
         description,
         budget,
-        category: req.body.category || "General",
+        category: category || "General",
         skills,
         deadline: new Date(deadline),
         clientId: req.userId!,
@@ -734,6 +906,171 @@ router.post(
 
     await invalidateCache("jobs:list:*");
     void RecommendationQueueService.enqueueRebuild(job.id);
+
+    // Near-real-time fraud/anomaly scoring (issue #900). Fire-and-forget: this
+    // never blocks or fails job creation.
+    FraudDetectionService.onJobCreated(job.id, req.userId!);
+
+    try {
+      const { getIo } = await import("../socket");
+      const io = getIo();
+      io.emit("job:created", job);
+    } catch {
+      // Socket not initialized (e.g., in tests)
+    }
+
+    res.status(201).json(job);
+  }),
+);
+
+// Atomically create a job together with all of its milestones (issue #1125).
+//
+// This replaces the frontend's old "POST /jobs then N× POST /milestones" loop,
+// which could leave a job persisted with a partial milestone set if a milestone
+// call failed midway, and could create a duplicate job if the user retried.
+//
+// Guarantees:
+//  - Atomic: the job and every milestone are written in a single transaction —
+//    either all succeed or nothing is persisted.
+//  - Idempotent: an optional client-supplied `idempotencyKey` is stored uniquely
+//    on the job. A retry with the same key returns the original job instead of
+//    creating a second one, even across concurrent requests (unique-constraint
+//    race is caught and resolved to the existing job).
+//  - Consistent budget: the job budget is derived from the sum of milestone
+//    amounts, so the persisted total can never diverge from the milestones.
+router.post(
+  "/with-milestones",
+  authenticate,
+  validate({ body: createJobWithMilestonesSchema }),
+  asyncHandler(async (req: AuthRequest, res: Response) => {
+    const user = await prisma.user.findUnique({
+      where: { id: req.userId },
+      select: { role: true },
+    });
+
+    if (!user || user.role !== "CLIENT") {
+      throw new AppError(ErrorCodes.FORBIDDEN, "Only clients can post jobs.", 403);
+    }
+
+    const {
+      title,
+      description,
+      skills,
+      deadline,
+      milestones,
+    } = req.body as {
+      title: string;
+      description: string;
+      skills: string[];
+      deadline: string;
+      milestones: Array<{
+        title: string;
+        description: string;
+        amount: number;
+        dueDate: string;
+      }>;
+    };
+    const category = req.body.category as string | undefined;
+    const paymentToken = req.body.paymentToken as string | undefined;
+    const idempotencyKey = req.body.idempotencyKey as string | undefined;
+
+    if (category && !isValidCategory(category)) {
+      return res.status(422).json({
+        code: "InvalidCategory",
+        message: `"${category}" is not a recognised category. Valid categories: ${VALID_CATEGORIES.join(", ")}.`,
+      });
+    }
+
+    // Budget is the sum of milestone amounts (7-dp rounded to match XLM scale),
+    // never taken from the client — this is what keeps the persisted total in
+    // lockstep with the milestone set.
+    const budget = Number(
+      milestones.reduce((sum, m) => sum + m.amount, 0).toFixed(7),
+    );
+    const platformMinimum = Number.isFinite(config.platformMinBudgetXlm)
+      ? config.platformMinBudgetXlm
+      : 1;
+    if (budget < platformMinimum) {
+      return res.status(422).json({
+        code: "BudgetBelowMinimum",
+        message: `Budget must be at least ${platformMinimum} XLM`,
+      });
+    }
+
+    // Idempotency fast-path: if we've already recorded this key, return the
+    // original job rather than creating another. A retry after a partial failure
+    // lands here and gets the completed job back.
+    if (idempotencyKey) {
+      const existing = await prisma.job.findUnique({
+        where: { idempotencyKey },
+        include: JOB_DETAIL_INCLUDE,
+      });
+      if (existing) {
+        if (existing.clientId !== req.userId) {
+          throw new AppError(
+            ErrorCodes.CONFLICT,
+            "This idempotency key belongs to another user's request.",
+            409,
+          );
+        }
+        return res.status(200).json(existing);
+      }
+    }
+
+    let job;
+    try {
+      // Nested writes in a single create are executed in one transaction by
+      // Prisma, so the job and all milestones commit together or not at all.
+      job = await prisma.$transaction((tx) =>
+        tx.job.create({
+          data: {
+            title,
+            description,
+            budget,
+            category: category || "General",
+            skills,
+            deadline: new Date(deadline),
+            clientId: req.userId!,
+            ...(paymentToken ? { paymentToken } : {}),
+            ...(idempotencyKey ? { idempotencyKey } : {}),
+            milestones: {
+              create: milestones.map((m, index) => ({
+                title: m.title,
+                description: m.description,
+                amount: m.amount,
+                dueDate: new Date(m.dueDate),
+                order: index + 1,
+              })),
+            },
+          },
+          include: JOB_DETAIL_INCLUDE,
+        }),
+      );
+    } catch (err) {
+      // Concurrent retry raced us to the same idempotency key: the unique
+      // constraint fired. Resolve to the job the other request created rather
+      // than surfacing an error or duplicating.
+      if (
+        idempotencyKey &&
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === "P2002"
+      ) {
+        const existing = await prisma.job.findUnique({
+          where: { idempotencyKey },
+          include: JOB_DETAIL_INCLUDE,
+        });
+        if (existing) {
+          return res.status(200).json(existing);
+        }
+      }
+      throw err;
+    }
+
+    await invalidateCache("jobs:list:*");
+    void RecommendationQueueService.enqueueRebuild(job.id);
+
+    // Near-real-time fraud/anomaly scoring (issue #900). Fire-and-forget.
+    FraudDetectionService.onJobCreated(job.id, req.userId!);
 
     try {
       const { getIo } = await import("../socket");
@@ -765,15 +1102,30 @@ router.put(
     });
 
     if (!job) {
-      return res.status(404).json({ error: "Job not found." });
+      throw new AppError(ErrorCodes.NOT_FOUND, "Job not found.", 404);
     }
     if (job.clientId !== req.userId) {
-      return res
-        .status(403)
-        .json({ error: "Not authorized to update this job." });
+      throw new AppError(ErrorCodes.FORBIDDEN, "Not authorized to update this job.", 403);
     }
 
     const updateData = req.body;
+
+    if (
+      updateData.status &&
+      ["COMPLETED", "DISPUTED", "CANCELLED", "EXPIRED"].includes(updateData.status)
+    ) {
+      return res.status(400).json({
+        error: `Cannot update job status to ${updateData.status} directly.`,
+      });
+    }
+
+    if (updateData.category && !isValidCategory(updateData.category)) {
+      return res.status(422).json({
+        code: "InvalidCategory",
+        message: `"${updateData.category}" is not a recognised category. Valid categories: ${VALID_CATEGORIES.join(", ")}.`,
+      });
+    }
+
     if (updateData.deadline) {
       updateData.deadline = new Date(updateData.deadline);
     }
@@ -807,12 +1159,10 @@ router.delete(
     });
 
     if (!job) {
-      return res.status(404).json({ error: "Job not found." });
+      throw new AppError(ErrorCodes.NOT_FOUND, "Job not found.", 404);
     }
     if (job.clientId !== req.userId) {
-      return res
-        .status(403)
-        .json({ error: "Not authorized to delete this job." });
+      throw new AppError(ErrorCodes.FORBIDDEN, "Not authorized to delete this job.", 403);
     }
 
     await prisma.job.update({
@@ -828,7 +1178,7 @@ router.delete(
   }),
 );
 
-// Update job status
+// Chain-owned job statuses must only be changed by the escrow event projection.
 router.patch(
   "/:id/status",
   authenticate,
@@ -838,8 +1188,6 @@ router.patch(
   }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
     const id = req.params.id as string;
-    const { status } = req.body;
-
     const job = await prisma.job.findFirst({
       where: {
         id,
@@ -848,25 +1196,15 @@ router.patch(
     });
 
     if (!job) {
-      return res.status(404).json({ error: "Job not found." });
+      throw new AppError(ErrorCodes.NOT_FOUND, "Job not found.", 404);
     }
     if (job.clientId !== req.userId) {
-      return res
-        .status(403)
-        .json({ error: "Not authorized to update this job." });
+      throw new AppError(ErrorCodes.FORBIDDEN, "Not authorized to update this job.", 403);
     }
 
-    const updated = await prisma.job.update({
-      where: { id },
-      data: { status },
-      include: { milestones: true },
+    return res.status(403).json({
+      error: "Job status is derived from verified escrow events and cannot be updated directly.",
     });
-
-    await invalidateCache("jobs:list:*");
-    await invalidateCacheKey(generateJobCacheKey(id));
-    void RecommendationQueueService.enqueueRebuild(id);
-
-    res.json(updated);
   }),
 );
 
@@ -878,61 +1216,18 @@ router.patch(
   asyncHandler(async (req: AuthRequest, res: Response) => {
     const id = req.params.id as string;
 
-    const job = await prisma.job.findFirst({
-      where: {
-        id,
-        deletedAt: null,
-      },
-      include: { milestones: true, freelancer: true },
-    });
+    const job = await prisma.job.findFirst({ where: { id, deletedAt: null } });
 
     if (!job) {
-      return res.status(404).json({ error: "Job not found." });
+      throw new AppError(ErrorCodes.NOT_FOUND, "Job not found.", 404);
     }
     if (job.clientId !== req.userId) {
-      return res
-        .status(403)
-        .json({ error: "Only the client can mark the job as complete." });
+      throw new AppError(ErrorCodes.FORBIDDEN, "Only the client can mark the job as complete.", 403);
     }
 
-    const allApproved = job.milestones.every((m) => m.status === "APPROVED");
-    if (!allApproved) {
-      return res.status(400).json({
-        error: "All milestones must be approved before completing the job.",
-      });
-    }
-
-    const updated = await prisma.job.update({
-      where: { id },
-      data: { status: "COMPLETED" },
-      include: { milestones: true, client: true, freelancer: true },
+    return res.status(403).json({
+      error: "Job completion is derived from a verified escrow release and cannot be set directly.",
     });
-
-    const { NotificationService } =
-      await import("../services/notification.service");
-
-    if (job.freelancerId) {
-      await NotificationService.sendNotification({
-        userId: job.freelancerId,
-        type: "MILESTONE_APPROVED",
-        title: "Job Completed",
-        message: `The client has marked "${job.title}" as complete. Please leave a review!`,
-        metadata: { jobId: id },
-      });
-    }
-
-    const { getIo } = await import("../socket");
-    const io = getIo();
-    io.to(`user:${job.clientId}`).emit("job:completed", { jobId: id });
-    if (job.freelancerId) {
-      io.to(`user:${job.freelancerId}`).emit("job:completed", { jobId: id });
-    }
-
-    await invalidateCache("jobs:list:*");
-    await invalidateCacheKey(generateJobCacheKey(id));
-    void RecommendationQueueService.enqueueRebuild(id);
-
-    res.json(updated);
   }),
 );
 
@@ -948,7 +1243,7 @@ router.post(
     });
 
     if (!user || user.role !== "FREELANCER") {
-      return res.status(403).json({ error: "Only freelancers can save jobs." });
+      throw new AppError(ErrorCodes.FORBIDDEN, "Only freelancers can save jobs.", 403);
     }
 
     const id = req.params.id as string;
@@ -960,7 +1255,7 @@ router.post(
     });
 
     if (!job) {
-      return res.status(404).json({ error: "Job not found." });
+      throw new AppError(ErrorCodes.NOT_FOUND, "Job not found.", 404);
     }
 
     const existingSave = await prisma.savedJob.findUnique({
@@ -973,7 +1268,7 @@ router.post(
     });
 
     if (existingSave) {
-      return res.status(409).json({ error: "Job already saved." });
+      throw new AppError(ErrorCodes.CONFLICT, "Job already saved.", 409);
     }
 
     const savedJob = await prisma.savedJob.create({
@@ -1002,9 +1297,7 @@ router.delete(
     });
 
     if (!user || user.role !== "FREELANCER") {
-      return res
-        .status(403)
-        .json({ error: "Only freelancers can unsave jobs." });
+      throw new AppError(ErrorCodes.FORBIDDEN, "Only freelancers can unsave jobs.", 403);
     }
 
     const id = req.params.id as string;
@@ -1019,7 +1312,7 @@ router.delete(
     });
 
     if (!savedJob) {
-      return res.status(404).json({ error: "Job was not saved." });
+      throw new AppError(ErrorCodes.NOT_FOUND, "Job was not saved.", 404);
     }
 
     await prisma.savedJob.delete({

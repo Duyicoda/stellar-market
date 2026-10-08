@@ -4,12 +4,18 @@
  */
 import {
   PrismaClient,
+  Prisma,
   DisputeStatus,
   JobStatus,
   EscrowStatus,
+  DisputeEventType,
 } from "@prisma/client";
 import { createError } from "../middleware/error";
 import { NotificationService } from "./notification.service";
+import { ContractService } from "./contract.service";
+import { logger } from "../lib/logger";
+import { recordDisputeEvent } from "./dispute-event.service";
+import { ReputationCacheService } from "./reputation-cache.service";
 
 const prisma = new PrismaClient();
 
@@ -136,6 +142,11 @@ export class DisputeService {
       skipBatching: true,
     });
 
+    await recordDisputeEvent(dispute.id, DisputeEventType.DISPUTE_OPENED, {
+      initiatorId,
+      initiatorUsername: dispute.initiator.username,
+    });
+
     return dispute;
   }
 
@@ -254,7 +265,7 @@ export class DisputeService {
   /**
    * Get dispute by ID with full details
    */
-  static async getDisputeById(id: string) {
+  static async getDisputeById(id: string, includeVotes: boolean = false) {
     const dispute = await prisma.dispute.findUnique({
       where: { id },
       include: {
@@ -302,28 +313,123 @@ export class DisputeService {
             avatarUrl: true,
           },
         },
-        votes: {
-          include: {
-            voter: {
-              select: {
-                id: true,
-                username: true,
-                walletAddress: true,
-                avatarUrl: true,
+        votes: includeVotes
+          ? {
+              include: {
+                voter: {
+                  select: {
+                    id: true,
+                    username: true,
+                    walletAddress: true,
+                    avatarUrl: true,
+                  },
+                },
               },
-            },
-          },
-          orderBy: { createdAt: "desc" },
-        },
+              orderBy: { createdAt: "desc" },
+            }
+          : false,
         attachments: true,
+        _count: { select: { votes: true } },
       },
     });
 
     if (!dispute) {
-      throw new Error("Dispute not found");
+      throw createError("Dispute not found", 404);
     }
 
-    return dispute;
+    const votes = await prisma.disputeVote.findMany({
+      where: { disputeId: id },
+      select: { choice: true },
+    });
+    const totalVotes = votes.length;
+    const clientVotes = votes.filter((v) => v.choice === "CLIENT").length;
+    const freelancerVotes = votes.filter((v) => v.choice === "FREELANCER").length;
+    const splitVotes = totalVotes - clientVotes - freelancerVotes;
+
+    let arbitrators: Array<{ address: string; displayName: string; avatarUrl: string | null }> = [];
+    if (dispute.onChainDisputeId) {
+      try {
+        const addresses = await ContractService.getOnChainAssignedArbitrators(dispute.onChainDisputeId);
+        if (addresses && addresses.length > 0) {
+          arbitrators = await Promise.all(
+            addresses.map(async (address) => {
+              const user = await prisma.user.findFirst({
+                where: { walletAddress: address },
+                select: { username: true, avatarUrl: true },
+              });
+              if (user) {
+                return {
+                  address,
+                  displayName: user.username,
+                  avatarUrl: user.avatarUrl,
+                };
+              } else {
+                return {
+                  address,
+                  displayName: `${address.slice(0, 4)}...${address.slice(-4)}`,
+                  avatarUrl: null,
+                };
+              }
+            })
+          );
+        }
+      } catch (err) {
+        logger.warn({ err, onChainDisputeId: dispute.onChainDisputeId }, "Failed to get on-chain arbitrators");
+      }
+    }
+
+    // Destructuring-to-omit: `votes`/`_count` are dropped from the response on purpose.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { votes: _votes, _count, ...rest } = dispute;
+
+    return {
+      ...rest,
+      voteSummary: {
+        totalVotes,
+        clientVotes,
+        freelancerVotes,
+        splitVotes,
+      },
+      arbitrators,
+    };
+  }
+
+  static async getVotesByDisputeId(
+    disputeId: string,
+    cursor?: string,
+    limit: number = 20,
+  ) {
+    const safeLimit = Math.min(limit, 100);
+
+    const votes = await prisma.disputeVote.findMany({
+      where: { disputeId },
+      take: safeLimit + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      include: {
+        voter: {
+          select: {
+            id: true,
+            username: true,
+            walletAddress: true,
+            avatarUrl: true,
+          },
+        },
+      },
+      orderBy: { createdAt: "desc" },
+    });
+
+    const hasMore = votes.length > safeLimit;
+    const items = hasMore ? votes.slice(0, safeLimit) : votes;
+    const nextCursor = hasMore ? items[items.length - 1].id : null;
+
+    return {
+      votes: items,
+      pagination: {
+        nextCursor,
+        hasMore,
+        limit: safeLimit,
+      },
+    };
   }
 
   /**
@@ -339,7 +445,7 @@ export class DisputeService {
     const skip = (page - 1) * limit;
 
     // Build where clause based on filter
-    let where: any = {
+    let where: Prisma.DisputeWhereInput = {
       OR: [
         { clientId: userId },
         { freelancerId: userId },
@@ -366,43 +472,40 @@ export class DisputeService {
         ? { createdAt: "desc" as const }
         : { createdAt: "asc" as const };
 
-    const [disputes, total] = await Promise.all([
-      prisma.dispute.findMany({
-        where,
-        include: {
-          job: { select: { id: true, title: true, budget: true } },
-          client: {
-            select: {
-              id: true,
-              username: true,
-              walletAddress: true,
-              avatarUrl: true,
-            },
+    const disputes = await prisma.dispute.findMany({
+      where,
+      include: {
+        job: { select: { id: true, title: true, budget: true } },
+        client: {
+          select: {
+            id: true,
+            username: true,
+            walletAddress: true,
+            avatarUrl: true,
           },
-          freelancer: {
-            select: {
-              id: true,
-              username: true,
-              walletAddress: true,
-              avatarUrl: true,
-            },
-          },
-          initiator: {
-            select: {
-              id: true,
-              username: true,
-              walletAddress: true,
-              avatarUrl: true,
-            },
-          },
-          _count: { select: { votes: true } },
         },
-        orderBy,
-        skip,
-        take: limit,
-      }),
-      prisma.dispute.count({ where }),
-    ]);
+        freelancer: {
+          select: {
+            id: true,
+            username: true,
+            walletAddress: true,
+            avatarUrl: true,
+          },
+        },
+        initiator: {
+          select: {
+            id: true,
+            username: true,
+            walletAddress: true,
+            avatarUrl: true,
+          },
+        },
+        _count: { select: { votes: true } },
+      },
+      orderBy,
+      skip,
+      take: limit,
+    });
 
     // Transform disputes to include jobTitle and otherPartyName
     const transformedDisputes = disputes.map((dispute) => {
@@ -427,14 +530,14 @@ export class DisputeService {
    * Get disputes with filtering and pagination
    */
   static async getDisputes(
-    filters: { status?: DisputeStatus },
+    filters: { status?: DisputeStatus; userFilter?: Record<string, unknown> },
     pagination: { page: number; limit: number },
   ) {
-    const { status } = filters;
+    const { status, userFilter } = filters;
     const { page, limit } = pagination;
     const skip = (page - 1) * limit;
 
-    const where = status ? { status } : {};
+    const where = { ...(status ? { status } : {}), ...userFilter };
 
     const [disputes, total] = await Promise.all([
       prisma.dispute.findMany({
@@ -502,16 +605,16 @@ export class DisputeService {
     });
 
     if (!dispute) {
-      throw new Error("Dispute not found");
+      throw createError("Dispute not found", 404);
     }
 
     if (dispute.status === DisputeStatus.RESOLVED) {
-      throw new Error("Cannot vote on a resolved dispute");
+      throw createError("Cannot vote on a resolved dispute", 409);
     }
 
     // Prevent participants from voting
     if (voterId === dispute.clientId || voterId === dispute.freelancerId) {
-      throw new Error("Dispute participants cannot vote");
+      throw createError("Dispute participants cannot vote", 403);
     }
 
     // Check for duplicate vote
@@ -525,7 +628,7 @@ export class DisputeService {
     });
 
     if (existingVote) {
-      throw new Error("You have already voted on this dispute");
+      throw createError("You have already voted on this dispute", 409);
     }
 
     // Create vote
@@ -581,6 +684,13 @@ export class DisputeService {
       });
     }
 
+    const voteCount = await prisma.disputeVote.count({ where: { disputeId } });
+    await recordDisputeEvent(disputeId, DisputeEventType.VOTE_CAST, {
+      voterId,
+      choice,
+      voteCount,
+    });
+
     return vote;
   }
 
@@ -594,11 +704,11 @@ export class DisputeService {
     });
 
     if (!dispute) {
-      throw new Error("Dispute not found");
+      throw createError("Dispute not found", 404);
     }
 
     if (dispute.status === DisputeStatus.RESOLVED) {
-      throw new Error("Dispute is already resolved");
+      throw createError("Dispute is already resolved", 409);
     }
 
     // Update dispute
@@ -652,6 +762,22 @@ export class DisputeService {
       skipBatching: true,
     });
 
+    await recordDisputeEvent(disputeId, DisputeEventType.VERDICT_REACHED, {
+      outcome,
+    });
+
+    // Invalidate reputation cache for both parties (dispute outcome affects reputation)
+    if (updatedDispute.client?.walletAddress) {
+      await ReputationCacheService.invalidateCache(
+        updatedDispute.client.walletAddress,
+      );
+    }
+    if (updatedDispute.freelancer?.walletAddress) {
+      await ReputationCacheService.invalidateCache(
+        updatedDispute.freelancer.walletAddress,
+      );
+    }
+
     return updatedDispute;
   }
 
@@ -666,13 +792,12 @@ export class DisputeService {
     voterId?: string;
     choice?: "CLIENT" | "FREELANCER";
     outcome?: string;
-    metadata?: Record<string, any>;
+    metadata?: Record<string, unknown>;
   }) {
     const {
       type,
       disputeId,
       onChainDisputeId,
-      jobId,
       voterId,
       choice,
       outcome,
@@ -681,31 +806,36 @@ export class DisputeService {
     switch (type) {
       case "DISPUTE_RAISED":
         if (!onChainDisputeId || !disputeId) {
-          throw new Error("Missing required fields for DISPUTE_RAISED");
+          throw createError("Missing required fields for DISPUTE_RAISED", 400);
         }
         // Update dispute with on-chain ID
         await prisma.dispute.update({
           where: { id: disputeId },
           data: { onChainDisputeId },
         });
+        await recordDisputeEvent(
+          disputeId,
+          DisputeEventType.ARBITRATOR_ASSIGNED,
+          { onChainDisputeId },
+        );
         break;
 
       case "VOTE_CAST":
         if (!disputeId || !voterId || !choice) {
-          throw new Error("Missing required fields for VOTE_CAST");
+          throw createError("Missing required fields for VOTE_CAST", 400);
         }
         // Vote should already be recorded via API, this is confirmation
         break;
 
       case "DISPUTE_RESOLVED":
         if (!disputeId || !outcome) {
-          throw new Error("Missing required fields for DISPUTE_RESOLVED");
+          throw createError("Missing required fields for DISPUTE_RESOLVED", 400);
         }
         await this.resolveDispute(disputeId, outcome);
         break;
 
       default:
-        throw new Error(`Unknown webhook type: ${type}`);
+        throw createError(`Unknown webhook type: ${type}`, 400);
     }
 
     return { success: true, message: `Webhook ${type} processed successfully` };

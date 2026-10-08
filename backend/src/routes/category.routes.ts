@@ -2,19 +2,12 @@ import { Router, Request, Response } from "express";
 import { PrismaClient } from "@prisma/client";
 import { asyncHandler } from "../middleware/error";
 import { cache } from "../lib/cache";
+import { JOB_CATEGORIES } from "../constants/categories";
 
 const router = Router();
 const prisma = new PrismaClient();
 
-const VALID_CATEGORIES = [
-  "Frontend",
-  "Backend",
-  "Smart Contract",
-  "Design",
-  "Mobile",
-  "Documentation",
-  "DevOps",
-] as const;
+const VALID_CATEGORIES = JOB_CATEGORIES;
 
 const CATEGORY_ICONS: Record<string, string> = {
   Frontend: "Monitor",

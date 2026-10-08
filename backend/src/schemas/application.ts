@@ -42,5 +42,5 @@ export const getApplicationsQuerySchema = paginationSchema.extend({
 });
 
 export const getApplicationByIdParamSchema = z.object({
-  id: z.string().min(1, "ID is required"),
+  id: z.string().cuid("Invalid id format"),
 });

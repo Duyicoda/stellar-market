@@ -1,10 +1,14 @@
 import { Router, Response } from "express";
 import { PrismaClient } from "@prisma/client";
+import rateLimit from "express-rate-limit";
 import { z } from "zod";
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { authenticate, AuthRequest } from "../middleware/auth";
 import { validate } from "../middleware/validation";
+import { config } from "../config";
+import { logger } from "../lib/logger";
 import {
   upload,
   UPLOAD_DIR,
@@ -18,11 +22,32 @@ import { auditLogger } from "../utils/auditLogger";
 const router = Router();
 const prisma = new PrismaClient();
 
+// Rate limiter for uploads (10 uploads per hour per user)
+const uploadRateLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  keyGenerator: (req) => {
+    const userId = (req as AuthRequest).userId;
+    if (userId) return String(userId);
+    return (req.ip ?? req.socket?.remoteAddress ?? "anon").replace(/^::ffff:/i, "");
+  },
+  validate: { ip: false },
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (_req, res) => {
+    res
+      .status(429)
+      .json({ error: "Upload limit reached — you may upload up to 10 files per hour" });
+  },
+});
+
 // Validation schemas
 const uploadSchema = {
   body: z.object({
     jobId: z.string().optional(),
     disputeId: z.string().optional(),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/, "Invalid SHA-256 hash").optional(),
+    anchorTxHash: z.string().min(1).optional(),
   }),
 };
 
@@ -62,6 +87,7 @@ router.get("/avatars/:filename", (req, res) => {
 router.post(
   "/",
   authenticate,
+  uploadRateLimiter,
   upload.single("file"),
   validate(uploadSchema),
   async (req: AuthRequest, res: Response) => {
@@ -70,9 +96,8 @@ router.post(
         return res.status(400).json({ error: "No file uploaded" });
       }
 
-      const { jobId, disputeId } = req.body;
+      const { jobId, disputeId, sha256, anchorTxHash } = req.body;
 
-      // Validate that at least one of jobId or disputeId is provided
       if (!jobId && !disputeId) {
         // Clean up uploaded file
         fs.unlinkSync(req.file.path);
@@ -82,11 +107,17 @@ router.post(
       }
 
       // Validate file content (MIME sniffing)
-      const validation = await validateFileMimeType(req.file.path);
+      const validation = await validateFileMimeType(req.file.path, req.file.mimetype);
       if (!validation.valid) {
         // Clean up uploaded file
         fs.unlinkSync(req.file.path);
-        return res.status(400).json({
+        
+        const statusCode = validation.error?.includes("match actual file content") || 
+                           validation.error?.includes("Unsupported file type signature") 
+                           ? 415 
+                           : 400;
+                           
+        return res.status(statusCode).json({
           error: validation.error || "Invalid file type",
         });
       }
@@ -154,7 +185,52 @@ router.post(
         }
       }
 
-      // Create attachment record
+      // If disputeId provided, verify dispute exists and user has access
+      if (disputeId) {
+        const dispute = await prisma.dispute.findUnique({
+          where: { id: disputeId },
+          select: {
+            id: true,
+            clientId: true,
+            freelancerId: true,
+          },
+        });
+
+        if (!dispute) {
+          fs.unlinkSync(req.file.path);
+          return res.status(404).json({ error: "Dispute not found" });
+        }
+
+        // Only dispute client or freelancer can upload files
+        if (dispute.clientId !== req.userId && dispute.freelancerId !== req.userId) {
+          fs.unlinkSync(req.file.path);
+          return res.status(403).json({
+            error: "Only dispute participants can upload files",
+          });
+        }
+      }
+
+      if (anchorTxHash) {
+        try {
+          const horizonRes = await fetch(
+            `${config.stellar.horizonUrl}/transactions/${anchorTxHash}`,
+          );
+          if (!horizonRes.ok) {
+            fs.unlinkSync(req.file.path);
+            return res.status(422).json({
+              error:
+                "Anchor transaction not found on the Stellar network. Provide a valid transaction hash.",
+            });
+          }
+        } catch {
+          fs.unlinkSync(req.file.path);
+          return res.status(502).json({
+            error:
+              "Unable to verify anchor transaction on the Stellar network. Please try again.",
+          });
+        }
+      }
+
       const attachment = await prisma.attachment.create({
         data: {
           uploaderId: req.userId!,
@@ -165,6 +241,8 @@ router.post(
           mimeType: validation.detectedType || req.file.mimetype,
           size: req.file.size,
           url: `/api/uploads/${req.file.filename}`,
+          sha256: sha256 || null,
+          anchorTxHash: anchorTxHash || null,
         },
         include: {
           uploader: {
@@ -181,20 +259,20 @@ router.post(
         ...attachment,
         sizeFormatted: formatFileSize(attachment.size),
       });
-    } catch (error: any) {
+    } catch (error) {
       // Clean up file if it was uploaded
       if (req.file && fs.existsSync(req.file.path)) {
         fs.unlinkSync(req.file.path);
       }
 
       // Handle multer errors
-      if (error.code === "LIMIT_FILE_SIZE") {
+      if ((error as { code?: string })?.code === "LIMIT_FILE_SIZE") {
         return res.status(400).json({
           error: `File too large. Maximum size is ${formatFileSize(MAX_FILE_SIZE)}`,
         });
       }
 
-      console.error("Error uploading file:", error);
+      logger.error({ err: error }, "Error uploading file:");
       res.status(500).json({ error: "Failed to upload file" });
     }
   },
@@ -226,6 +304,13 @@ router.get(
                 freelancerId: true,
               },
             },
+            dispute: {
+              select: {
+                id: true,
+                clientId: true,
+                freelancerId: true,
+              },
+            },
           },
         });
       } else {
@@ -234,6 +319,13 @@ router.get(
           where: { id: attachmentId },
           include: {
             job: {
+              select: {
+                id: true,
+                clientId: true,
+                freelancerId: true,
+              },
+            },
+            dispute: {
               select: {
                 id: true,
                 clientId: true,
@@ -257,6 +349,14 @@ router.get(
         if (!isParticipant && attachment.uploaderId !== req.userId) {
           return res.status(403).json({ error: "Access denied" });
         }
+      } else if (attachment.dispute) {
+        const isDisputeParty =
+          attachment.dispute.clientId === req.userId ||
+          attachment.dispute.freelancerId === req.userId;
+
+        if (!isDisputeParty && attachment.uploaderId !== req.userId) {
+          return res.status(403).json({ error: "Access denied" });
+        }
       } else if (attachment.uploaderId !== req.userId) {
         return res.status(403).json({ error: "Access denied" });
       }
@@ -278,8 +378,99 @@ router.get(
       const fileStream = fs.createReadStream(filePath);
       fileStream.pipe(res);
     } catch (error) {
-      console.error("Error downloading file:", error);
+      logger.error({ err: error }, "Error downloading file:");
       res.status(500).json({ error: "Failed to download file" });
+    }
+  },
+);
+
+/**
+ * GET /api/uploads/:id/verify
+ * Re-compute SHA-256 of the stored file and compare against the recorded hash
+ */
+router.get(
+  "/:id/verify",
+  authenticate,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const attachment = await prisma.attachment.findUnique({
+        where: { id: req.params.id as string },
+        include: {
+          job: {
+            select: {
+              id: true,
+              clientId: true,
+              freelancerId: true,
+            },
+          },
+          dispute: {
+            select: {
+              id: true,
+              clientId: true,
+              freelancerId: true,
+            },
+          },
+        },
+      });
+
+      if (!attachment) {
+        return res.status(404).json({ error: "Attachment not found" });
+      }
+
+      // Access control: reuse the same logic as the download route
+      if (attachment.job) {
+        const isParticipant =
+          attachment.job.clientId === req.userId ||
+          attachment.job.freelancerId === req.userId;
+
+        if (!isParticipant && attachment.uploaderId !== req.userId) {
+          return res.status(403).json({ error: "Access denied" });
+        }
+      } else if (attachment.dispute) {
+        const isDisputeParty =
+          attachment.dispute.clientId === req.userId ||
+          attachment.dispute.freelancerId === req.userId;
+
+        if (!isDisputeParty && attachment.uploaderId !== req.userId) {
+          return res.status(403).json({ error: "Access denied" });
+        }
+      } else if (attachment.uploaderId !== req.userId) {
+        return res.status(403).json({ error: "Access denied" });
+      }
+
+      if (!attachment.sha256) {
+        return res.status(400).json({
+          error: "No integrity hash recorded for this attachment",
+        });
+      }
+
+      const filePath = path.join(UPLOAD_DIR, attachment.filename);
+      if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: "File not found on server" });
+      }
+
+      const hash = crypto.createHash("sha256");
+      const stream = fs.createReadStream(filePath);
+
+      await new Promise<void>((resolve, reject) => {
+        stream.on("data", (chunk) => hash.update(chunk));
+        stream.on("end", resolve);
+        stream.on("error", reject);
+      });
+
+      const computedHash = hash.digest("hex");
+      const intact = computedHash === attachment.sha256;
+
+      res.json({
+        intact,
+        storedHash: attachment.sha256,
+        computedHash,
+        anchorTxHash: attachment.anchorTxHash,
+        fileName: attachment.originalName,
+      });
+    } catch (error) {
+      logger.error({ err: error }, "Error verifying file integrity:");
+      res.status(500).json({ error: "Failed to verify file integrity" });
     }
   },
 );
@@ -324,7 +515,7 @@ router.delete(
 
       res.json({ message: "File deleted successfully" });
     } catch (error) {
-      console.error("Error deleting file:", error);
+      logger.error({ err: error }, "Error deleting file:");
       res.status(500).json({ error: "Failed to delete file" });
     }
   },
@@ -375,13 +566,13 @@ router.get(
       });
 
       res.json({
-        attachments: attachments.map((att: any) => ({
+        attachments: attachments.map((att) => ({
           ...att,
           sizeFormatted: formatFileSize(att.size),
         })),
       });
     } catch (error) {
-      console.error("Error fetching job attachments:", error);
+      logger.error({ err: error }, "Error fetching job attachments:");
       res.status(500).json({ error: "Failed to fetch attachments" });
     }
   },

@@ -1,90 +1,84 @@
-import Redis from "ioredis";
+import { Queue, Worker } from "bullmq";
 import RedisClient from "../lib/redis";
 import { RecommendationService } from "./recommendation.service";
 import { logger } from "../lib/logger";
 
-const RECOMMENDATION_REBUILD_QUEUE_KEY = "queue:recommendations:rebuild";
-const RECOMMENDATION_REBUILD_INTERVAL_MS = 2_000;
+const connection = RedisClient.getInstance();
 
-let workerTimer: NodeJS.Timeout | null = null;
-let workerRunning = false;
+// BullMQ's Worker issues blocking Redis commands and requires a connection with
+// maxRetriesPerRequest: null (the shared app-wide client uses a finite retry count
+// for its own non-blocking commands, so the Worker gets its own duplicated connection).
+const workerConnection = connection.duplicate({
+  maxRetriesPerRequest: null,
+  lazyConnect: false,
+});
 
-type RecommendationRebuildJob = {
+export type RecommendationRebuildJob = {
   jobId: string;
 };
 
-function getQueueConnection(): Redis {
-  return RedisClient.getInstance();
+let queue: Queue<RecommendationRebuildJob> | null = null;
+let worker: Worker<RecommendationRebuildJob> | null = null;
+
+function getQueue(): Queue<RecommendationRebuildJob> {
+  if (!queue) {
+    queue = new Queue<RecommendationRebuildJob>("recommendation-rebuild", {
+      connection,
+      defaultJobOptions: {
+        attempts: 3,
+        backoff: { type: "exponential", delay: 1000 },
+        removeOnComplete: 500,
+        removeOnFail: false,
+      },
+    });
+  }
+  return queue;
 }
 
-async function enqueue(job: RecommendationRebuildJob): Promise<void> {
-  try {
-    if (!RedisClient.isRedisConnected()) {
-      await RedisClient.connect();
-    }
-
-    await getQueueConnection().rpush(
-      RECOMMENDATION_REBUILD_QUEUE_KEY,
-      JSON.stringify(job),
-    );
-  } catch (error) {
-    logger.warn({ err: error }, "Failed to enqueue recommendation rebuild job");
-  }
+export function getRecommendationRebuildQueue(): Queue<RecommendationRebuildJob> {
+  return getQueue();
 }
 
-async function drainQueueOnce(): Promise<void> {
-  if (workerRunning) {
-    return;
-  }
+function startRecommendationWorker(): void {
+  if (worker) return;
 
-  workerRunning = true;
+  worker = new Worker<RecommendationRebuildJob>(
+    "recommendation-rebuild",
+    async (job) => {
+      await RecommendationService.rebuildRecommendationsForJob(job.data.jobId);
+    },
+    {
+      connection: workerConnection,
+      concurrency: 5,
+    },
+  );
 
-  try {
-    if (!RedisClient.isRedisConnected()) {
-      await RedisClient.connect();
+  worker.on("failed", (job, err) => {
+    if (job) {
+      logger.error(
+        { jobId: job.id, jobData: job.data, err },
+        "Recommendation rebuild job failed after all retries",
+      );
     }
+  });
 
-    const redis = getQueueConnection();
-
-    while (true) {
-      const rawJob = await redis.lpop(RECOMMENDATION_REBUILD_QUEUE_KEY);
-      if (!rawJob) {
-        break;
-      }
-
-      try {
-        const payload = JSON.parse(rawJob) as RecommendationRebuildJob;
-        await RecommendationService.rebuildRecommendationsForJob(payload.jobId);
-      } catch (error) {
-        logger.error({ err: error }, "Failed to process recommendation rebuild job");
-      }
-    }
-  } catch (error) {
-    logger.warn({ err: error }, "Recommendation rebuild worker is unavailable");
-  } finally {
-    workerRunning = false;
-  }
+  logger.info("Recommendation rebuild worker started");
 }
 
 export class RecommendationQueueService {
   static async enqueueRebuild(jobId: string): Promise<void> {
-    await enqueue({ jobId });
+    await getQueue().add("rebuild", { jobId });
   }
 
   static startWorker(): void {
-    if (workerTimer) {
-      return;
-    }
-
-    workerTimer = setInterval(() => {
-      void drainQueueOnce();
-    }, RECOMMENDATION_REBUILD_INTERVAL_MS);
+    startRecommendationWorker();
   }
 
-  static stopWorker(): void {
-    if (workerTimer) {
-      clearInterval(workerTimer);
-      workerTimer = null;
+  static async stopWorker(): Promise<void> {
+    if (worker) {
+      await worker.close();
+      worker = null;
     }
+    workerConnection.disconnect();
   }
 }

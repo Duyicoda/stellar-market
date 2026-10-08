@@ -4,13 +4,14 @@ import React from "react";
 import Link from "next/link";
 import { ArrowRight, LayoutDashboard } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
+import Reveal from "./Reveal";
 
 export default function CTASection() {
   const { user } = useAuth();
 
   return (
     <section className="border-t border-theme-border py-20 bg-gradient-to-b from-theme-bg to-theme-card">
-      <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
+      <Reveal className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
         <h2 className="text-4xl font-bold text-theme-heading mb-6">
           Ready to join the future of work?
         </h2>
@@ -19,7 +20,7 @@ export default function CTASection() {
           top talent or looking for your next big project, StellarMarket is the
           place to be.
         </p>
-        
+
         {user ? (
           <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
             <Link href="/dashboard" className="btn-primary flex items-center gap-2">
@@ -40,7 +41,7 @@ export default function CTASection() {
             </Link>
           </div>
         )}
-      </div>
+      </Reveal>
     </section>
   );
 }

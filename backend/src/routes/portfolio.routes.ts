@@ -5,6 +5,7 @@ import fs from "fs";
 import path from "path";
 import { authenticate, AuthRequest } from "../middleware/auth";
 import { validate } from "../middleware/validation";
+import { logger } from "../lib/logger";
 import {
   portfolioUpload,
   PORTFOLIO_UPLOAD_DIR,
@@ -90,7 +91,7 @@ router.get("/user/:userId", async (req, res) => {
     });
     res.json({ items });
   } catch (error) {
-    console.error("Error fetching portfolio items:", error);
+    logger.error({ err: error }, "Error fetching portfolio items:");
     res.status(500).json({ error: "Failed to fetch portfolio items" });
   }
 });
@@ -150,16 +151,16 @@ router.post(
         ...item,
         sizeFormatted: formatFileSize(item.size),
       });
-    } catch (error: any) {
+    } catch (error) {
       if (req.file && fs.existsSync(req.file.path)) {
         fs.unlinkSync(req.file.path);
       }
-      if (error.code === "LIMIT_FILE_SIZE") {
+      if ((error as { code?: string })?.code === "LIMIT_FILE_SIZE") {
         return res.status(400).json({
           error: `File too large. Maximum size is ${formatFileSize(PORTFOLIO_MAX_FILE_SIZE)}`,
         });
       }
-      console.error("Error creating portfolio item:", error);
+      logger.error({ err: error }, "Error creating portfolio item:");
       res.status(500).json({ error: "Failed to create portfolio item" });
     }
   },
@@ -199,7 +200,7 @@ router.put(
 
       res.json({ message: "Portfolio items reordered successfully" });
     } catch (error) {
-      console.error("Error reordering portfolio items:", error);
+      logger.error({ err: error }, "Error reordering portfolio items:");
       res.status(500).json({ error: "Failed to reorder portfolio items" });
     }
   },
@@ -239,7 +240,7 @@ router.put(
 
       res.json({ ...updated, sizeFormatted: formatFileSize(updated.size) });
     } catch (error) {
-      console.error("Error updating portfolio item:", error);
+      logger.error({ err: error }, "Error updating portfolio item:");
       res.status(500).json({ error: "Failed to update portfolio item" });
     }
   },
@@ -275,7 +276,7 @@ router.delete(
 
       res.json({ message: "Portfolio item deleted successfully" });
     } catch (error) {
-      console.error("Error deleting portfolio item:", error);
+      logger.error({ err: error }, "Error deleting portfolio item:");
       res.status(500).json({ error: "Failed to delete portfolio item" });
     }
   },

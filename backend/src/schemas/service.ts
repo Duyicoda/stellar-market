@@ -49,5 +49,5 @@ export const getServicesQuerySchema = paginationSchema.extend({
 });
 
 export const serviceIdParamSchema = z.object({
-  id: z.string().min(1, "Service ID is required"),
+  id: z.string().cuid("Invalid id format"),
 });

@@ -1,12 +1,12 @@
 "use client";
 
-import { useState, useRef, type ChangeEvent, type FormEvent } from "react";
+import { useState, useRef, useEffect, type ChangeEvent, type FormEvent } from "react";
 import { X, Star, Loader2, Clock } from "lucide-react";
 import axios, { AxiosError } from "axios";
 import { Job } from "@/types";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api/v1";
 
 type ReviewModalProps = {
   job: Job;
@@ -35,6 +35,18 @@ export default function ReviewModal({
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Reset form state when modal opens
+  useEffect(() => {
+    if (isOpen) {
+      setRating(0);
+      setHoveredRating(0);
+      setComment("");
+      setSubmitting(false);
+      setSubmitted(false);
+      setError(null);
+    }
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
@@ -179,14 +191,32 @@ export default function ReviewModal({
                 role="radiogroup"
                 aria-label="Star rating"
                 aria-required="true"
+                onKeyDown={(e) => {
+                  if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+                  e.preventDefault();
+                  const current = rating || 1;
+                  const next =
+                    e.key === "ArrowRight"
+                      ? Math.min(current + 1, 5)
+                      : Math.max(current - 1, 1);
+                  setRating(next);
+                  setError(null);
+                  (
+                    e.currentTarget.querySelector(
+                      `[data-star="${next}"]`,
+                    ) as HTMLButtonElement | null
+                  )?.focus();
+                }}
               >
                 {[1, 2, 3, 4, 5].map((star) => (
                   <button
                     key={star}
+                    data-star={star}
                     type="button"
                     role="radio"
                     aria-checked={rating === star}
                     aria-label={`${star} star${star > 1 ? "s" : ""} — ${ratingLabels[star]}`}
+                    tabIndex={star === (rating || 1) ? 0 : -1}
                     onClick={() => {
                       setRating(star);
                       setError(null);

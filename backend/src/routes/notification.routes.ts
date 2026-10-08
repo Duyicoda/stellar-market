@@ -1,4 +1,5 @@
 import { Router, Response } from "express";
+import { z } from "zod";
 import { authenticate, AuthRequest } from "../middleware/auth";
 import { validate } from "../middleware/validation";
 import { asyncHandler } from "../middleware/error";
@@ -23,7 +24,9 @@ router.get(
   authenticate,
   validate({ query: getNotificationsQuerySchema }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { page, limit } = req.query as any;
+    const { page, limit } = req.query as unknown as z.infer<
+      typeof getNotificationsQuerySchema
+    >;
     const result = await NotificationService.getNotifications(
       req.userId!,
       page,
@@ -49,7 +52,7 @@ router.put(
   authenticate,
   validate({ params: getNotificationByIdParamSchema }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
-    const id = (req as any).params.id as string;
+    const id = req.params.id as string;
     await NotificationService.markAsRead(id, req.userId!);
     res.status(204).send();
   }),
@@ -71,7 +74,7 @@ router.delete(
   authenticate,
   validate({ params: getNotificationByIdParamSchema }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
-    const id = (req as any).params.id as string;
+    const id = req.params.id as string;
     const notification = await NotificationService.getById(id);
     if (!notification)
       return res.status(404).json({ error: "Notification not found." });
@@ -90,6 +93,44 @@ router.delete(
   asyncHandler(async (req: AuthRequest, res: Response) => {
     await NotificationService.deleteAllRead(req.userId!);
     res.status(204).send();
+  }),
+);
+
+// Subscribe to push notifications
+router.post(
+  "/push/subscribe",
+  authenticate,
+  asyncHandler(async (req: AuthRequest, res: Response) => {
+    const { endpoint, keys } = req.body;
+
+    if (!endpoint || !keys?.p256dh || !keys?.auth) {
+      return res.status(400).json({ error: "Invalid push subscription data." });
+    }
+
+    await NotificationService.subscribeToPush(req.userId!, {
+      endpoint,
+      p256dh: keys.p256dh,
+      auth: keys.auth,
+    });
+
+    res.status(201).json({ message: "Successfully subscribed to push notifications." });
+  }),
+);
+
+// Unsubscribe from push notifications
+router.delete(
+  "/push/unsubscribe",
+  authenticate,
+  asyncHandler(async (req: AuthRequest, res: Response) => {
+    const { endpoint } = req.body;
+
+    if (!endpoint) {
+      return res.status(400).json({ error: "Endpoint is required." });
+    }
+
+    await NotificationService.unsubscribeFromPush(req.userId!, endpoint);
+
+    res.status(200).json({ message: "Successfully unsubscribed from push notifications." });
   }),
 );
 

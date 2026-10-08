@@ -1,3 +1,48 @@
+// ─── Notification queue mock (avoids Redis connection at module load) ─────────
+jest.mock("../../lib/notification-queue", () => ({
+  startNotificationWorker: jest.fn(),
+  stopNotificationWorker: jest.fn().mockResolvedValue(undefined),
+  notificationQueue: { add: jest.fn() },
+  getNotificationPriority: jest.fn().mockReturnValue(4),
+}));
+
+// ─── Redis mock (socket/index.ts now needs a client for the redis adapter and
+// presence registry; the fake supports the pub/sub + KV surface both use) ────
+jest.mock("../../lib/redis", () => {
+  // jest.mock factories are hoisted above imports and can't close over
+  // module-scoped bindings, so this must stay a require().
+  // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
+  const { FakeRedisBus, mockRedisModule } = require("../../lib/__tests__/testUtils/fakeRedis");
+  return mockRedisModule(new FakeRedisBus());
+});
+jest.mock("../../lib/token-version", () => ({
+  getCurrentTokenVersion: jest.fn().mockResolvedValue(0),
+}));
+
+jest.mock("../../lib/user-cache", () => ({
+  getCachedUserAuthData: jest.fn().mockImplementation((userId: string) =>
+    Promise.resolve({
+      id: userId,
+      role: "CLIENT",
+      emailVerified: true,
+      deletedAt: null,
+      isSuspended: false,
+      suspendReason: null,
+    }),
+  ),
+}));
+
+// ─── Prisma mock ─────────────────────────────────────────────────────────────
+jest.mock("@prisma/client", () => {
+  const mockPrisma = {
+    pendingNotification: {
+      findMany: jest.fn().mockResolvedValue([]),
+      update: jest.fn(),
+    },
+  };
+  return { PrismaClient: jest.fn(() => mockPrisma) };
+});
+
 import { createServer } from "http";
 import { Server as SocketServer } from "socket.io";
 import ioc from "socket.io-client";

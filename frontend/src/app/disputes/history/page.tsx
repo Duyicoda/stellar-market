@@ -15,7 +15,7 @@ import { Dispute } from "@/types";
 import EmptyState from "@/components/EmptyState";
 import DisputeHistoryCardSkeleton from "@/components/skeletons/DisputeHistoryCardSkeleton";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api/v1";
 
 interface DisputeHistoryItem extends Dispute {
   jobTitle: string;
@@ -35,7 +35,7 @@ export default function DisputeHistoryPage() {
   useEffect(() => {
     const fetchDisputeHistory = async () => {
       try {
-        const token = localStorage.getItem("token");
+        const token = localStorage.getItem("stellarmarket_jwt");
         const res = await axios.get(`${API_URL}/disputes/history`, {
           headers: token ? { Authorization: `Bearer ${token}` } : {},
           params: { filter, sortBy },
@@ -59,6 +59,11 @@ export default function DisputeHistoryPage() {
         return "bg-stellar-blue/10 text-stellar-blue";
       case "RESOLVED":
         return "bg-theme-success/10 text-theme-success";
+      case "VOTING":
+        return "bg-stellar-blue/10 text-stellar-blue";
+      case "RESOLVED_CLIENT":
+      case "RESOLVED_FREELANCER":
+        return "bg-theme-success/10 text-theme-success";
       default:
         return "bg-theme-text/10 text-theme-text";
     }
@@ -71,6 +76,11 @@ export default function DisputeHistoryPage() {
       case "IN_PROGRESS":
         return <Clock size={16} />;
       case "RESOLVED":
+        return <CheckCircle size={16} />;
+      case "VOTING":
+        return <Clock size={16} />;
+      case "RESOLVED_CLIENT":
+      case "RESOLVED_FREELANCER":
         return <CheckCircle size={16} />;
       default:
         return <ShieldAlert size={16} />;

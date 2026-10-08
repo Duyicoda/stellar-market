@@ -1,6 +1,7 @@
 import NodeClam from "clamscan";
 import fs from "fs";
 import { auditLogger } from "./auditLogger";
+import { logger } from "../lib/logger";
 
 let clamScanInstance: NodeClam | null = null;
 let clamAvailable = false;
@@ -13,9 +14,7 @@ const ENABLE_VIRUS_SCAN = process.env.ENABLE_VIRUS_SCAN !== "false";
  */
 export async function initializeVirusScanner(): Promise<void> {
   if (!ENABLE_VIRUS_SCAN) {
-    console.log(
-      "[VirusScanner] Virus scanning disabled via ENABLE_VIRUS_SCAN=false",
-    );
+    logger.info("[VirusScanner] Virus scanning disabled via ENABLE_VIRUS_SCAN=false");
     return;
   }
 
@@ -38,18 +37,18 @@ export async function initializeVirusScanner(): Promise<void> {
     // Test connection
     const version = await clamScanInstance.getVersion();
     clamAvailable = true;
-    console.log(
-      `[VirusScanner] ClamAV initialized successfully. Version: ${version}`,
-    );
-  } catch (error: any) {
+    logger.info(`[VirusScanner] ClamAV initialized successfully. Version: ${version}`);
+  } catch (error) {
     clamAvailable = false;
-    console.warn(
-      `[VirusScanner] ClamAV initialization failed: ${error.message}. Virus scanning will be skipped.`,
+    const errMessage = error instanceof Error ? error.message : String(error);
+    logger.warn(
+      { err: errMessage },
+      `[VirusScanner] ClamAV initialization failed. Virus scanning will be skipped.`,
     );
     auditLogger.log({
       action: "VIRUS_SCANNER_INIT_FAILED",
       userId: "system",
-      details: { error: error.message },
+      details: { error: errMessage },
       ipAddress: "localhost",
     });
   }
@@ -119,22 +118,23 @@ export async function scanFile(filePath: string): Promise<ScanResult> {
     return {
       isInfected: false,
     };
-  } catch (error: any) {
+  } catch (error) {
     // Log error but don't fail the upload - degrade gracefully
-    console.error(`[VirusScanner] Scan error for ${filePath}:`, error.message);
+    const errMessage = error instanceof Error ? error.message : String(error);
+    logger.error({ err: errMessage, filePath }, `[VirusScanner] Scan error for ${filePath}`);
     auditLogger.log({
       action: "VIRUS_SCAN_ERROR",
       userId: "system",
       details: {
         filePath,
-        error: error.message,
+        error: errMessage,
       },
       ipAddress: "localhost",
     });
 
     return {
       isInfected: false,
-      error: error.message,
+      error: errMessage,
       skipped: true,
     };
   }

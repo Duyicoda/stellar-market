@@ -13,6 +13,8 @@ type TransactionConfirmationModalProps = {
   transactionXdr: string | null;
   onClose: () => void;
   onConfirm: (preparedXdr: string) => Promise<void>;
+  /** Optional content rendered above the transaction preview (e.g. rate info). */
+  extraContent?: React.ReactNode;
 };
 
 function formatStroops(value: bigint): string {
@@ -30,6 +32,7 @@ export default function TransactionConfirmationModal({
   transactionXdr,
   onClose,
   onConfirm,
+  extraContent,
 }: TransactionConfirmationModalProps) {
   const modalRef = useRef<HTMLDivElement>(null);
 
@@ -93,11 +96,16 @@ export default function TransactionConfirmationModal({
   };
 
   return (
-    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+    <div
+      className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="transaction-confirmation-title"
+    >
       <div ref={modalRef} className="w-full max-w-xl overflow-hidden rounded-2xl border border-theme-border bg-theme-bg shadow-2xl">
         <div className="flex items-center justify-between border-b border-theme-border px-5 py-4">
           <div>
-            <h2 className="text-lg font-semibold text-theme-heading">{title}</h2>
+            <h2 id="transaction-confirmation-title" className="text-lg font-semibold text-theme-heading">{title}</h2>
             <p className="text-sm text-theme-text">{description}</p>
           </div>
           <button
@@ -112,6 +120,7 @@ export default function TransactionConfirmationModal({
         </div>
 
         <div className="space-y-4 px-5 py-5">
+          {extraContent}
           {loadingPreview && (
             <div className="flex items-center gap-3 rounded-xl border border-theme-border bg-theme-card px-4 py-4 text-sm text-theme-text">
               <Loader2 className="animate-spin text-stellar-blue" size={18} />

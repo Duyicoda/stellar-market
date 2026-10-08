@@ -5,13 +5,13 @@
  */
 import {
   PrismaClient,
+  Prisma,
   DeadlineExtensionStatus,
-  JobStatus,
 } from "@prisma/client";
 import { createError } from "../middleware/error";
 import { ContractService } from "./contract.service";
 import { NotificationService } from "./notification.service";
-import { config } from "../config";
+import { logger } from "../lib/logger";
 
 const prisma = new PrismaClient();
 
@@ -60,6 +60,12 @@ export class DeadlineExtensionService {
     // Validate new deadline is in the future
     if (newDeadline <= new Date()) {
       throw createError("New deadline must be in the future", 400);
+    }
+
+    // Validate new deadline is later than the current deadline
+    const currentDeadline = milestone.contractDeadline ?? milestone.dueDate ?? job.deadline;
+    if (currentDeadline && newDeadline <= currentDeadline) {
+      throw createError("New deadline must be later than the current deadline", 400);
     }
 
     // Check for existing pending extension request
@@ -165,7 +171,7 @@ export class DeadlineExtensionService {
 
     // Update approval status
     let newStatus: DeadlineExtensionStatus = DeadlineExtensionStatus.PENDING;
-    let updateData: any = { updatedAt: new Date() };
+    const updateData: Prisma.DeadlineExtensionRequestUpdateInput = { updatedAt: new Date() };
 
     if (isClient) {
       updateData.clientApprovedAt = new Date();
@@ -218,7 +224,8 @@ export class DeadlineExtensionService {
 
     // If both parties have approved, execute the on-chain transaction
     if (newStatus === DeadlineExtensionStatus.APPROVED_BY_BOTH) {
-      await this.executeExtensionOnChain(updated);
+      const { xdr, message } = await this.executeExtensionOnChain(updated);
+      return { ...updated, xdr, message };
     }
 
     return updated;
@@ -301,10 +308,21 @@ export class DeadlineExtensionService {
    * Execute the deadline extension on-chain
    * Called after both parties have approved
    */
-  static async executeExtensionOnChain(extensionRequest: any) {
+  static async executeExtensionOnChain(
+    extensionRequest: Prisma.DeadlineExtensionRequestGetPayload<{
+      include: {
+        milestone: true;
+        job: { include: { client: true; freelancer: true } };
+      };
+    }>,
+  ) {
     try {
       const job = extensionRequest.job;
       const milestone = extensionRequest.milestone;
+
+      if (!job.client.walletAddress) {
+        throw createError("Client has no linked wallet address", 400);
+      }
 
       // Build the transaction XDR
       const xdr = await ContractService.buildExtendDeadlineTx(
@@ -331,7 +349,7 @@ export class DeadlineExtensionService {
           "Both parties have approved. Please sign the transaction to complete the extension.",
       };
     } catch (error) {
-      console.error("Error executing extension on-chain:", error);
+      logger.error({ err: error }, "Error executing extension on-chain:");
       throw createError("Failed to prepare on-chain transaction", 500);
     }
   }
@@ -342,17 +360,30 @@ export class DeadlineExtensionService {
   static async confirmExtensionTransaction(
     extensionRequestId: string,
     txHash: string,
+    userId: string,
   ) {
     const extensionRequest = await prisma.deadlineExtensionRequest.findUnique({
       where: { id: extensionRequestId },
       include: {
         milestone: true,
-        job: true,
+        job: { include: { client: true, freelancer: true } },
       },
     });
 
     if (!extensionRequest) {
       throw createError("Extension request not found", 404);
+    }
+
+    // Validate the caller is a job participant (IDOR guard)
+    const job = extensionRequest.job;
+    const isClient = job.clientId === userId;
+    const isFreelancer = job.freelancerId === userId;
+
+    if (!isClient && !isFreelancer) {
+      throw createError(
+        "Only job participants can confirm extension transactions",
+        403,
+      );
     }
 
     // Update milestone deadline
@@ -378,7 +409,6 @@ export class DeadlineExtensionService {
     });
 
     // Notify both parties
-    const job = extensionRequest.job;
     const message = `Deadline for milestone "${extensionRequest.milestone.title}" has been extended to ${extensionRequest.newDeadline.toLocaleDateString()}.`;
 
     await NotificationService.sendNotification({

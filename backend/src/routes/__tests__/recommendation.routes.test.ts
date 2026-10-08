@@ -19,17 +19,21 @@ jest.mock("@prisma/client", () => {
     application: { findMany: jest.fn() },
   };
   return {
-    PrismaClient: jest.fn(() => mockPrisma) as any,
+    PrismaClient: jest.fn(() => mockPrisma),
     UserRole: {
       CLIENT: "CLIENT",
       FREELANCER: "FREELANCER",
       ADMIN: "ADMIN",
-    } as any,
+    },
   };
 });
 
 import { PrismaClient } from "@prisma/client";
-const prismaMock = new PrismaClient() as any;
+const prismaMock = new PrismaClient() as unknown as {
+  user: { findUnique: jest.Mock };
+  job: { findMany: jest.Mock };
+  application: { findMany: jest.Mock };
+};
 
 // ─── App setup ───────────────────────────────────────────────────────────────
 

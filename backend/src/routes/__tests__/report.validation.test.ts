@@ -41,4 +41,19 @@ describe("report route validation", () => {
     expect(response.body.error).toBe("Validation failed");
     expect(reportCreateMock).not.toHaveBeenCalled();
   });
+
+  it("rejects report payloads with an oversized targetId", async () => {
+    const oversizedTargetId = "a".repeat(256);
+    const response = await request(app)
+      .post("/api/reports")
+      .send({
+        targetType: "JOB",
+        targetId: oversizedTargetId,
+        reason: "Valid reason text with enough length",
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("Validation failed");
+    expect(reportCreateMock).not.toHaveBeenCalled();
+  });
 });

@@ -2,5 +2,9 @@
 const fs = require('fs');
 const { swaggerSpec } = require('./src/config/swagger');
 
+// Use shared logger so logs include requestId and redact sensitive fields
+const { logger, installRequestIdConsolePatch } = require('./src/lib/logger');
+installRequestIdConsolePatch();
+
 fs.writeFileSync('./openapi.json', JSON.stringify(swaggerSpec, null, 2));
-console.log('openapi.json exported');
+logger.info('openapi.json exported');

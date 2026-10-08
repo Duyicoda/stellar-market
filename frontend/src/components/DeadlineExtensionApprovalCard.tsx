@@ -10,7 +10,7 @@ import {
 } from "lucide-react";
 import axios, { AxiosError } from "axios";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api/v1";
 
 interface ExtensionRequest {
   id: string;
@@ -60,7 +60,7 @@ export default function DeadlineExtensionApprovalCard({
     setError(null);
 
     try {
-      const token = localStorage.getItem("token");
+      const token = localStorage.getItem("stellarmarket_jwt");
       await axios.post(
         `${API_URL}/deadline-extensions/${extensionRequest.id}/approve`,
         {},
@@ -88,7 +88,7 @@ export default function DeadlineExtensionApprovalCard({
     setError(null);
 
     try {
-      const token = localStorage.getItem("token");
+      const token = localStorage.getItem("stellarmarket_jwt");
       await axios.post(
         `${API_URL}/deadline-extensions/${extensionRequest.id}/reject`,
         { rejectionReason: rejectionReason.trim() },

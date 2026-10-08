@@ -91,6 +91,9 @@
                 },
                 {
                   "u64": 86400
+                },
+                {
+                  "u32": 518400
                 }
               ]
             }
@@ -113,6 +116,15 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 0
+                  }
+                },
+                {
+                  "u32": 0
                 }
               ]
             }
@@ -273,6 +285,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "expiry_ledger"
+                      },
+                      "val": {
+                        "u32": 518400
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "freelancer"
                       },
                       "val": {
@@ -360,6 +380,12 @@
                                     }
                                   ]
                                 }
+                              },
+                              {
+                                "key": {
+                                  "symbol": "token"
+                                },
+                                "val": "void"
                               }
                             ]
                           }
@@ -388,6 +414,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "token_balances"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "total_amount"
                       },
                       "val": {
@@ -403,7 +437,7 @@
             },
             "ext": "v0"
           },
-          4095
+          535000
         ]
       ],
       [
@@ -448,7 +482,7 @@
             },
             "ext": "v0"
           },
-          4095
+          6311999
         ]
       ],
       [
@@ -858,7 +892,7 @@
             },
             "ext": "v0"
           },
-          4095
+          6311999
         ]
       ]
     ]
@@ -1127,6 +1161,9 @@
                 },
                 {
                   "u64": 86400
+                },
+                {
+                  "u32": 518400
                 }
               ]
             }
@@ -1225,6 +1262,15 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 0
+                  }
+                },
+                {
+                  "u32": 0
                 }
               ]
             }
@@ -1500,6 +1546,14 @@
                 },
                 {
                   "key": {
+                    "symbol": "expiry_ledger"
+                  },
+                  "val": {
+                    "u32": 518400
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "freelancer"
                   },
                   "val": {
@@ -1587,6 +1641,12 @@
                                 }
                               ]
                             }
+                          },
+                          {
+                            "key": {
+                              "symbol": "token"
+                            },
+                            "val": "void"
                           }
                         ]
                       }
@@ -1611,6 +1671,14 @@
                   },
                   "val": {
                     "address": "CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "token_balances"
+                  },
+                  "val": {
+                    "vec": []
                   }
                 },
                 {
@@ -1640,64 +1708,16 @@
           "v0": {
             "topics": [
               {
-                "symbol": "error"
+                "symbol": "fn_return"
               },
               {
-                "error": {
-                  "object": "unexpected_size"
-                }
+                "symbol": "submit_review"
               }
             ],
             "data": {
-              "string": "differing host map and output slice lengths when unpacking map to slice"
-            }
-          }
-        }
-      },
-      "failed_call": true
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000002",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "log"
+              "error": {
+                "contract": 5
               }
-            ],
-            "data": {
-              "vec": [
-                {
-                  "string": "caught panic 'called `Result::unwrap()` on an `Err` value: HostError: Error(Object, UnexpectedSize)\\n\\nEvent log (newest first):\\n   0: [Diagnostic Event] contract:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4, topics:[error, Error(Object, UnexpectedSize)], data:\"differing host map and output slice lengths when unpacking map to slice\"\\n   1: [Diagnostic Event] contract:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM, topics:[fn_return, get_job], data:{auto_refund_after: 86400, client: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M, freelancer: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4, funded_amount: 100, id: 1, job_deadline: 9999999999, milestones: [{amount: 100, deadline: 9999999999, description: \"Task\", id: 0, status: [Pending]}], status: [Funded], token: CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN, total_amount: 100}\\n   2: [Diagnostic Event] contract:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4, topics:[fn_call, Bytes(0000000000000000000000000000000000000000000000000000000000000001), get_job], data:1\\n   3: [Diagnostic Event] topics:[fn_call, Bytes(0000000000000000000000000000000000000000000000000000000000000002), submit_review], data:[CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM, CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M, CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4, 1, 5, \"Too early\", 10000000]\\n   4: [Diagnostic Event] contract:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM, topics:[fn_return, fund_job], data:Void\\n   5: [Contract Event] contract:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM, topics:[escrow, funded], data:[1, CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M, CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4, CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN, 100]\\n   6: [Diagnostic Event] contract:CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN, topics:[fn_return, transfer], data:Void\\n   7: [Contract Event] contract:CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN, topics:[transfer, CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M, CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM, \"aaa:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANHUF\"], data:100\\n   8: [Diagnostic Event] contract:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM, topics:[fn_call, Bytes(04cadb4a570fd2e4652e814101509912cce6c9a2325d6eec8d7100caf859f3e0), transfer], data:[CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M, CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM, 100]\\n   9: [Diagnostic Event] topics:[fn_call, Bytes(0000000000000000000000000000000000000000000000000000000000000001), fund_job], data:[1, CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M]\\n   10: [Diagnostic Event] contract:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM, topics:[fn_return, create_job], data:1\\n   11: [Contract Event] contract:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM, topics:[escrow, created], data:[1, CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M, CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4, CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN, 100]\\n   12: [Diagnostic Event] topics:[fn_call, Bytes(0000000000000000000000000000000000000000000000000000000000000001), create_job], data:[CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M, CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4, CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN, [[\"Task\", 100, 9999999999]], 9999999999, 86400]\\n   13: [Diagnostic Event] contract:CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN, topics:[fn_return, mint], data:Void\\n   14: [Contract Event] contract:CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN, topics:[mint, CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM, CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M, \"aaa:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANHUF\"], data:100000000\\n   15: [Diagnostic Event] topics:[fn_call, Bytes(04cadb4a570fd2e4652e814101509912cce6c9a2325d6eec8d7100caf859f3e0), mint], data:[CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M, 100000000]\\n   16: [Diagnostic Event] contract:CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN, topics:[fn_return, set_admin], data:Void\\n   17: [Contract Event] contract:CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN, topics:[set_admin, GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANHUF, \"aaa:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANHUF\"], data:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM\\n   18: [Diagnostic Event] topics:[fn_call, Bytes(04cadb4a570fd2e4652e814101509912cce6c9a2325d6eec8d7100caf859f3e0), set_admin], data:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM\\n   19: [Diagnostic Event] contract:CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN, topics:[fn_return, init_asset], data:Void\\n   20: [Diagnostic Event] topics:[fn_call, Bytes(04cadb4a570fd2e4652e814101509912cce6c9a2325d6eec8d7100caf859f3e0), init_asset], data:Bytes(0000000161616100000000000000000000000000000000000000000000000000000000000000000000000006)\\n\\nBacktrace (newest first):\\n   0: <soroban_env_host::host::Host as soroban_env_common::env::EnvBase>::map_unpack_to_slice::{{closure}}\\n             at /home/zarcc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/soroban-env-host-21.2.1/src/host.rs:938:33\\n   1: soroban_env_host::host_object::<impl soroban_env_host::host::Host>::visit_obj::{{closure}}\\n             at /home/zarcc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/soroban-env-host-21.2.1/src/host_object.rs:458:26\\n   2: soroban_env_host::host_object::<impl soroban_env_host::host::Host>::visit_obj_untyped\\n             at /home/zarcc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/soroban-env-host-21.2.1/src/host_object.rs:421:13\\n   3: soroban_env_host::host_object::<impl soroban_env_host::host::Host>::visit_obj\\n             at /home/zarcc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/soroban-env-host-21.2.1/src/host_object.rs:449:14\\n   4: <soroban_env_host::host::Host as soroban_env_common::env::EnvBase>::map_unpack_to_slice\\n             at /home/zarcc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/soroban-env-host-21.2.1/src/host.rs:936:14\\n   5: <soroban_sdk::env::Env as soroban_env_common::env::EnvBase>::map_unpack_to_slice\\n             at /home/zarcc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/soroban-sdk-21.7.7/src/env.rs:1627:14\\n   6: <stellar_market_reputation::escrow::Job as soroban_env_common::convert::TryFromVal<soroban_sdk::env::Env,soroban_env_common::val::Val>>::try_from_val\\n             at src/lib.rs:40:5\\n   7: soroban_sdk::env::Env::try_invoke_contract\\n             at /home/zarcc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/soroban-sdk-21.7.7/src/env.rs:413:40\\n   8: stellar_market_reputation::escrow::EscrowContractClient::try_get_job\\n             at src/lib.rs:54:5\\n   9: stellar_market_reputation::ReputationContract::submit_review\\n             at src/lib.rs:477:39\\n  10: stellar_market_reputation::__submit_review::invoke_raw\\n             at src/lib.rs:402:1\\n  11: stellar_market_reputation::__submit_review::invoke_raw_slice\\n             at src/lib.rs:402:1\\n  12: core::ops::function::Fn::call\\n             at /rustc/29483883eed69d5fb4db01964cdf2af4d86e9cb2/library/core/src/ops/function.rs:79:5\\n  13: stellar_market_reputation::__reputationcontract_fn_set_registry::call::{{closure}}\\n             at src/lib.rs:399:1\\n  14: core::option::Option<T>::map\\n             at /rustc/29483883eed69d5fb4db01964cdf2af4d86e9cb2/library/core/src/option.rs:1146:29\\n  15: stellar_market_reputation::__reputationcontract_fn_set_registry::call\\n             at src/lib.rs:399:1\\n  16: <stellar_market_reputation::ReputationContract as soroban_sdk::testutils::ContractFunctionSet>::call\\n             at src/lib.rs:399:1\\n  17: <soroban_sdk::env::Env::register_contract::InternalContractFunctionSet<T> as soroban_env_host::host::frame::ContractFunctionSet>::call\\n             at /home/zarcc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/soroban-sdk-21.7.7/src/env.rs:628:24\\n  18: soroban_env_host::host::frame::<impl soroban_env_host::host::Host>::call_n_internal::{{closure}}::{{closure}}\\n             at /home/zarcc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/soroban-env-host-21.2.1/src/host/frame.rs:868:64\\n  19: core::ops::function::FnOnce::call_once\\n             at /rustc/29483883eed69d5fb4db01964cdf2af4d86e9cb2/library/core/src/ops/function.rs:250:5\\n  20: <core::panic::unwind_safe::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once\\n             at /rustc/29483883eed69d5fb4db01964cdf2af4d86e9cb2/library/core/src/panic/unwind_safe.rs:272:9\\n  21: std::panicking::catch_unwind::do_call\\n             at /rustc/29483883eed69d5fb4db01964cdf2af4d86e9cb2/library/std/src/panicking.rs:589:40\\n  22: __rust_try\\n  23: std::panicking::catch_unwind\\n             at /rustc/29483883eed69d5fb4db01964cdf2af4d86e9cb2/library/std/src/panicking.rs:552:19\\n      std::panic::catch_unwind\\n             at /rustc/29483883eed69d5fb4db01964cdf2af4d86e9cb2/library/std/src/panic.rs:359:14\\n  24: soroban_env_host::testutils::call_with_suppressed_panic_hook\\n             at /home/zarcc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/soroban-env-host-21.2.1/src/testutils.rs:57:15\\n  25: soroban_env_host::host::frame::<impl soroban_env_host::host::Host>::call_n_internal::{{closure}}\\n             at /home/zarcc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/soroban-env-host-21.2.1/src/host/frame.rs:870:25\\n  26: soroban_env_host::host::frame::<impl soroban_env_host::host::Host>::with_frame\\n             at /home/zarcc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/soroban-env-host-21.2.1/src/host/frame.rs:453:19\\n  27: soroban_env_host::host::frame::<impl soroban_env_host::host::Host>::call_n_internal\\n             at /home/zarcc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/soroban-env-host-21.2.1/src/host/frame.rs:845:29\\n  28: <soroban_env_host::host::Host as soroban_env_common::vmcaller_env::VmCallerEnv>::call\\n             at /home/zarcc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/soroban-env-host-21.2.1/src/host.rs:2304:24\\n  29: soroban_env_common::vmcaller_env::<impl soroban_env_common::env::Env for T>::call\\n             at /home/zarcc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/soroban-env-common-21.2.1/src/vmcaller_env.rs:195:84\\n  30: <soroban_sdk::env::Env as soroban_env_common::env::Env>::call\\n             at /home/zarcc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/soroban-sdk-21.7.7/src/env.rs:1667:64\\n  31: soroban_sdk::env::Env::invoke_contract\\n             at /home/zarcc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/soroban-sdk-21.7.7/src/env.rs:379:18\\n  32: stellar_market_reputation::ReputationContractClient::submit_review\\n             at src/lib.rs:402:1\\n  33: stellar_market_reputation::test::test_job_not_completed\\n             at src/test.rs:342:23\\n  34: stellar_market_reputation::test::test_job_not_completed::{{closure}}\\n             at src/test.rs:318:28\\n  35: core::ops::function::FnOnce::call_once\\n             at /rustc/29483883eed69d5fb4db01964cdf2af4d86e9cb2/library/core/src/ops/function.rs:250:5\\n\\n' from contract function 'Symbol(obj#361)'"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                },
-                {
-                  "u64": 1
-                },
-                {
-                  "u32": 5
-                },
-                {
-                  "string": "Too early"
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 10000000
-                  }
-                }
-              ]
             }
           }
         }
@@ -1717,12 +1737,12 @@
               },
               {
                 "error": {
-                  "wasm_vm": "invalid_action"
+                  "contract": 5
                 }
               }
             ],
             "data": {
-              "string": "caught error from function"
+              "string": "escalating Ok(ScErrorType::Contract) frame-exit to Err"
             }
           }
         }
@@ -1742,7 +1762,7 @@
               },
               {
                 "error": {
-                  "wasm_vm": "invalid_action"
+                  "contract": 5
                 }
               }
             ],
@@ -1802,7 +1822,7 @@
               },
               {
                 "error": {
-                  "wasm_vm": "invalid_action"
+                  "contract": 5
                 }
               }
             ],

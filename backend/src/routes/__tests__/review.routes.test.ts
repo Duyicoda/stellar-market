@@ -6,7 +6,7 @@ import express from "express";
 import jwt from "jsonwebtoken";
 import request from "supertest";
 
-var prismaMock = {
+const prismaMock = {
   job: { findUnique: jest.fn() },
   review: {
     create: jest.fn(),
@@ -39,7 +39,7 @@ jest.mock("@prisma/client", () => ({
   },
 }));
 
-const reviewRouter = require("../review.routes").default;
+import reviewRouter from "../review.routes";
 
 const app = express();
 app.use(express.json());
@@ -63,8 +63,8 @@ beforeEach(() => {
     role: "CLIENT",
     emailVerified: true,
   });
-  prismaMock.$transaction.mockImplementation(async (callback: any) =>
-    callback(prismaMock),
+  prismaMock.$transaction.mockImplementation(
+    async (callback: (tx: typeof prismaMock) => unknown) => callback(prismaMock),
   );
 });
 

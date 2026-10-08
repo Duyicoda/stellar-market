@@ -1,6 +1,8 @@
 import { AuthRequest, authenticate } from "../middleware/auth";
+import { walletSourceGuard } from "../middleware/wallet-guard";
 import { Prisma, PrismaClient } from "@prisma/client";
 import { Response, Router } from "express";
+import { z } from "zod";
 import {
   createReviewSchema,
   getReviewByIdParamSchema,
@@ -108,6 +110,7 @@ router.post("/",
    *               $ref: '#/components/schemas/ReviewsResponse'
    */
   authenticate,
+  walletSourceGuard,
   validate({ body: createReviewSchema }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
     const { jobId, revieweeId, rating, comment } = req.body;
@@ -200,10 +203,12 @@ router.get("/user/:userId",
 router.get("/",
   validate({ query: getReviewsQuerySchema }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { page, limit, jobId, reviewerId, revieweeId, rating } = req.query as any;
+    const { page, limit, jobId, reviewerId, revieweeId, rating } = req.query as unknown as z.infer<
+      typeof getReviewsQuerySchema
+    >;
     const skip = (page - 1) * limit;
 
-    const where: any = {};
+    const where: Prisma.ReviewWhereInput = {};
     if (jobId) where.jobId = jobId;
     if (reviewerId) where.reviewerId = reviewerId;
     if (revieweeId) where.revieweeId = revieweeId;
@@ -260,6 +265,7 @@ router.get("/:id",
 // Update a review
 router.put("/:id",
   authenticate,
+  walletSourceGuard,
   validate({
     params: getReviewByIdParamSchema,
     body: updateReviewSchema

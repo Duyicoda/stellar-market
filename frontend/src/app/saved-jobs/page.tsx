@@ -1,6 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, useCallback } from "react";
+import { useRouter } from "next/navigation";
 import { Bookmark, Search } from "lucide-react";
 import JobCard from "@/components/JobCard";
 import EmptyState from "@/components/EmptyState";
@@ -20,6 +21,7 @@ function matchesQuery(job: Job, query: string) {
 }
 
 export default function SavedJobsPage() {
+  const router = useRouter();
   const { savedJobs, isLoading, toggleSavedJob, refreshSavedJobs } =
     useSavedJobs();
   const [query, setQuery] = useState("");
@@ -29,15 +31,20 @@ export default function SavedJobsPage() {
     [query, savedJobs],
   );
 
-  const handleTagClick = (tag: string, type: "category" | "skill") => {
-    const params = new URLSearchParams();
-    if (type === "category") {
-      params.set("category", tag);
-    } else {
-      params.set("skills", tag);
-    }
-    window.location.href = `/jobs?${params.toString()}`;
-  };
+  // Client-side navigation to /jobs with the selected filter (no full reload).
+  // Mirrors the filter-update intent on the jobs listing page, but crosses routes.
+  const handleTagClick = useCallback(
+    (tag: string, type: "category" | "skill") => {
+      const params = new URLSearchParams();
+      if (type === "category") {
+        params.set("category", tag);
+      } else {
+        params.set("skills", tag);
+      }
+      router.push(`/jobs?${params.toString()}`);
+    },
+    [router],
+  );
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">

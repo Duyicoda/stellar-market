@@ -8,7 +8,7 @@ import JobCardSkeleton from "@/components/skeletons/JobCardSkeleton";
 import { Job, PaginatedResponse } from "@/types";
 import Link from "next/link";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api/v1";
 
 export default function FeaturedJobsCarousel() {
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -86,12 +86,6 @@ export default function FeaturedJobsCarousel() {
           className="flex overflow-x-auto gap-6 pb-6 snap-x snap-mandatory scrollbar-hide"
           style={{ scrollbarWidth: "none", msOverflowStyle: "none" }}
         >
-          <style dangerouslySetInnerHTML={{ __html: `
-            .scrollbar-hide::-webkit-scrollbar {
-                display: none;
-            }
-          `}} />
-          
           {loading ? (
             Array.from({ length: 4 }).map((_, i) => (
               <div key={i} className="min-w-[300px] md:min-w-[400px] flex-shrink-0 snap-start">

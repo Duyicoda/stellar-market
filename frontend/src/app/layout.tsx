@@ -2,7 +2,11 @@ import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import "./globals.css";
 import Navbar from "@/components/Navbar";
+import ScrollProgressBar from "@/components/ScrollProgressBar";
 import EmailVerificationBanner from "@/components/EmailVerificationBanner";
+import OfflineBanner from "@/components/OfflineBanner";
+import PushNotificationPrompt from "@/components/PushNotificationPrompt";
+import MobileNavigation from "@/components/MobileNavigation";
 import Footer from "@/components/Footer";
 import Providers from "./providers";
 
@@ -90,9 +94,13 @@ export default function RootLayout({
             Skip to main content
           </a>
           <Navbar />
+          <ScrollProgressBar />
           <EmailVerificationBanner />
-          <main id="main-content" className="min-h-screen">{children}</main>
+          <OfflineBanner />
+          <main id="main-content" className="min-h-screen pb-16 md:pb-0">{children}</main>
           <Footer />
+          <MobileNavigation />
+          <PushNotificationPrompt />
         </Providers>
       </body>
     </html>

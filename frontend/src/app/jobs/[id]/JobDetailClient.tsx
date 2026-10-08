@@ -1,7 +1,8 @@
 "use client";
 
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useParams } from "next/navigation";
+import { useQuery, useQueryClient, useInfiniteQuery } from "@tanstack/react-query";
 import {
   Clock,
   DollarSign,
@@ -15,19 +16,24 @@ import {
   XCircle,
   PencilLine,
   Star,
+  ChevronDown,
 } from "lucide-react";
 import Link from "next/link";
 import axios from "axios";
 import { useWallet } from "@/context/WalletContext";
 import { useAuth } from "@/context/AuthContext";
 import { PAYMENT_TOKENS, TOKEN_EXCHANGE_RATES } from "@/constants/jobs";
+import { useFocusTrap } from "@/hooks/useFocusTrap";
 import StatusBadge from "@/components/StatusBadge";
 import ApplyModal from "@/components/ApplyModal";
 import RaiseDisputeModal from "@/components/RaiseDisputeModal";
 import ReviewModal from "@/components/ReviewModal";
-import MilestoneTimeline from "@/components/MilestoneTimeline";
+import MilestoneTimeline, {
+  getMilestoneDraftKey,
+} from "@/components/MilestoneTimeline";
 import MilestoneProgressTracker from "@/components/MilestoneProgressTracker";
 import TransactionConfirmationModal from "@/components/TransactionConfirmationModal";
+import DepositRateInfo from "@/components/DepositRateInfo";
 import ProposeRevisionModal, {
   type ProposeRevisionMilestoneInput,
 } from "@/components/ProposeRevisionModal";
@@ -36,9 +42,11 @@ import { parseJobIdFromResult } from "@/utils/stellar";
 import ShareMenu from "@/components/ShareMenu";
 import { useToast } from "@/components/Toast";
 import WalletAddress from "@/components/WalletAddress";
+import ApproveMilestoneModal from "@/components/ApproveMilestoneModal";
+import Avatar from "@/components/Avatar";
 
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api/v1";
 
 function stroopsToXlm(stroops: string): number {
   try {
@@ -67,17 +75,205 @@ type PendingOnChainAction = {
   milestoneId?: string;
   newDeadline?: string;
   onChainJobId?: number | string;
+  /** Exchange-rate parity context for the FUND_JOB confirmation. */
+  rateInfo?: {
+    agreedValueStroops: string;
+    maxSlippageBps: number;
+  };
 };
 
-export default function JobDetailClient() {
+// Only the confirmTypes that actually move funds are tracked with the
+// backend's transaction-status endpoint (see WalletContext.signAndBroadcastTransaction),
+// since the Transaction model's `type` column is also used for the user-facing
+// financial transaction history and shouldn't be populated with non-monetary
+// actions (e.g. CREATE_JOB, PROPOSE_REVISION) under a misleading DEPOSIT/RELEASE/REFUND label.
+const MONEY_MOVING_TX_TYPE: Partial<
+  Record<PendingOnChainAction["confirmType"], "DEPOSIT" | "RELEASE" | "REFUND">
+> = {
+  FUND_JOB: "DEPOSIT",
+  APPROVE_MILESTONE: "RELEASE",
+  CANCEL_JOB: "REFUND",
+  CLAIM_REFUND: "REFUND",
+};
+
+// Endpoints that produce a fresh unsigned XDR for a given confirmType, reused
+// both for the initial build and to rebuild after an EXPIRED (canRetry) result.
+const CONFIRM_TYPE_ENDPOINT: Partial<Record<PendingOnChainAction["confirmType"], string>> = {
+  FUND_JOB: "/escrow/init-fund",
+  APPROVE_MILESTONE: "/escrow/init-approve",
+  CANCEL_JOB: "/escrow/init-cancel",
+  CLAIM_REFUND: "/escrow/init-refund",
+};
+
+// Saved after a successful broadcast but before (or after a failed) confirm-tx
+// call.  Persisted to localStorage so it survives a page reload.  The retry
+// path re-sends this hash to confirm-tx without re-signing or re-broadcasting.
+type PendingConfirmation = {
+  hash: string;
+  confirmType: PendingOnChainAction["confirmType"];
+  milestoneId?: string;
+  newDeadline?: string;
+  onChainJobId?: number | string;
+};
+
+// Unique key per action so concurrent approvals on different milestones each
+// get their own slot rather than the latter overwriting the former.
+function confirmActionKey(
+  confirmType: PendingOnChainAction["confirmType"],
+  milestoneId?: string,
+): string {
+  return `${confirmType}:${milestoneId ?? ""}`;
+}
+
+const CONFIRM_TYPE_LABEL: Partial<Record<PendingOnChainAction["confirmType"], string>> = {
+  FUND_JOB: "Fund escrow",
+  APPROVE_MILESTONE: "Approve milestone",
+  CANCEL_JOB: "Cancel and refund",
+  CLAIM_REFUND: "Claim refund",
+  SUBMIT_MILESTONE: "Submit milestone",
+  PROPOSE_REVISION: "Propose revision",
+  ACCEPT_REVISION: "Accept revision",
+  REJECT_REVISION: "Reject revision",
+  EXTEND_DEADLINE: "Extend deadline",
+  CREATE_JOB: "Initialize escrow",
+};
+
+export default function JobDetailClient({
+  initialJob,
+}: {
+  initialJob?: Job | null;
+}) {
   const { id } = useParams();
   const { address, balances, signAndBroadcastTransaction } = useWallet();
   const { user } = useAuth();
   const { toast } = useToast();
-  const [job, setJob] = useState<Job | null>(null);
-  const [reviews, setReviews] = useState<Review[]>([]);
-  const [reviewsLoading, setReviewsLoading] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const queryClient = useQueryClient();
+
+  const {
+    data: job = initialJob ?? null,
+    isLoading: isJobLoading,
+    isFetching: isJobFetching,
+    error: jobError
+  } = useQuery<Job | null>({
+    queryKey: ["job", id],
+    queryFn: async () => {
+      // Read the auth token with the correct key (stellarmarket_jwt) falling
+      // back to the legacy "token" key for backward compatibility (#958).
+      const token = localStorage.getItem("stellarmarket_jwt") ?? localStorage.getItem("token");
+      const res = await axios.get(`${API_URL}/jobs/${id}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      return res.data;
+    },
+    initialData: initialJob ?? undefined,
+    staleTime: 60_000,
+    // initialJob comes from an unauthenticated server-side fetch (SSR can't
+    // read the browser's token), which is deliberately a reduced shape —
+    // missing deadline/status/skills/etc. staleTime alone let that reduced
+    // data sit there as "fresh" for a full 60s (even across a hard refresh,
+    // since a fresh SSR fetch just re-seeds the same reduced shape), so a
+    // logged-in viewer's own authenticated, complete fetch never ran and
+    // e.g. the Apply button stayed hidden because job.status looked missing.
+    // Forcing a refetch on every mount doesn't defeat the point of
+    // initialData (instant first paint) — it just stops that first paint
+    // from being mistaken for the real, authenticated answer.
+    refetchOnMount: "always",
+  });
+
+  const {
+    data: reviews = [],
+    isLoading: reviewsLoading
+  } = useQuery<Review[]>({
+    queryKey: ["reviews", id],
+    queryFn: async () => {
+      const token = localStorage.getItem("stellarmarket_jwt") ?? localStorage.getItem("token");
+      const res = await axios.get<PaginatedResponse<Review>>(`${API_URL}/reviews`, {
+        params: { jobId: id, page: 1, limit: 50 },
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      return res.data.data ?? [];
+    },
+    staleTime: 60_000,
+  });
+
+  const {
+    data: myAppInfo
+  } = useQuery<{ applied: boolean; appId: string | null }>({
+    queryKey: ["application", id, user?.id],
+    queryFn: async () => {
+      const token = localStorage.getItem("stellarmarket_jwt") ?? localStorage.getItem("token");
+      if (!token || !user) return { applied: false, appId: null };
+      try {
+        const res = await axios.get<PaginatedResponse<Application>>(`${API_URL}/applications`, {
+          params: { jobId: id, freelancerId: user.id, limit: 1 },
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const applied = res.data.total > 0;
+        return {
+          applied,
+          appId: applied && res.data.data[0] ? res.data.data[0].id : null
+        };
+      } catch {
+        return { applied: false, appId: null };
+      }
+    },
+    enabled: !!user && user.role === "FREELANCER",
+    staleTime: 60_000,
+  });
+
+  const hasApplied = myAppInfo?.applied ?? false;
+  const myApplicationId = myAppInfo?.appId ?? null;
+
+  const PAGE_SIZE = 20;
+
+  const {
+    data: appsPages,
+    isLoading: loadingApps,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useInfiniteQuery({
+    queryKey: ["applications", id],
+    queryFn: async ({ pageParam = 1 }: { pageParam: number }) => {
+      const token = localStorage.getItem("stellarmarket_jwt") ?? localStorage.getItem("token");
+      const res = await axios.get<{ data: Application[]; total: number; page: number; totalPages: number }>(
+        `${API_URL}/jobs/${id}/applications`,
+        {
+          params: { page: pageParam, limit: PAGE_SIZE },
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        }
+      );
+      return res.data;
+    },
+    getNextPageParam: (lastPage) =>
+      lastPage.page < lastPage.totalPages ? lastPage.page + 1 : undefined,
+    initialPageParam: 1,
+    enabled: !!job && !!user && user.id === job.client.id,
+    staleTime: 60_000,
+  });
+
+  const applications = appsPages?.pages.flatMap((p) => p.data) ?? [];
+  const totalApplications = appsPages?.pages[0]?.total ?? 0;
+
+  const loading = isJobLoading;
+
+  const setJob = useCallback((updater: Job | null | ((prev: Job | null) => Job | null)) => {
+    queryClient.setQueryData<Job | null>(["job", id], (old) => {
+      if (typeof updater === 'function') {
+        return updater(old ?? null);
+      }
+      return updater;
+    });
+  }, [queryClient, id]);
+
+  const setHasApplied = (val: boolean) => {
+    queryClient.setQueryData<{ applied: boolean; appId: string | null } | undefined>(["application", id, user?.id], (old) => old ? { ...old, applied: val } : undefined);
+  };
+
+  const setMyApplicationId = (val: string | null) => {
+    queryClient.setQueryData<{ applied: boolean; appId: string | null } | undefined>(["application", id, user?.id], (old) => old ? { ...old, appId: val } : undefined);
+  };
+
   const [processing, setProcessing] = useState(false);
   const [actioningMilestoneId, setActioningMilestoneId] = useState<
     string | null
@@ -86,15 +282,36 @@ export default function JobDetailClient() {
     string | null
   >(null);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (jobError) {
+      setError(jobError instanceof Error ? jobError.message : "Failed to fetch job details.");
+    }
+  }, [jobError]);
+
   const [applyModalOpen, setApplyModalOpen] = useState(false);
   const [disputeModalOpen, setDisputeModalOpen] = useState(false);
   const [reviewModalOpen, setReviewModalOpen] = useState(false);
-  const [hasApplied, setHasApplied] = useState(false);
-  const [myApplicationId, setMyApplicationId] = useState<string | null>(null);
   const [withdrawConfirmOpen, setWithdrawConfirmOpen] = useState(false);
+  const withdrawConfirmRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(withdrawConfirmRef, { open: withdrawConfirmOpen, onClose: () => setWithdrawConfirmOpen(false) });
   const [withdrawing, setWithdrawing] = useState(false);
-  const [applications, setApplications] = useState<Application[]>([]);
-  const [loadingApps, setLoadingApps] = useState(false);
+
+  // Accepting an application never syncs the job's budget/milestones to the
+  // freelancer's bid — nothing prevents a client from accidentally accepting
+  // a bid that doesn't match what the job actually pays out. Surface that
+  // mismatch before the accept goes through instead of leaving it to be
+  // discovered mid-contract.
+  const [acceptBidMismatch, setAcceptBidMismatch] = useState<{
+    appId: string;
+    freelancerName: string;
+    bidAmount: number;
+  } | null>(null);
+  const acceptBidMismatchRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(acceptBidMismatchRef, {
+    open: !!acceptBidMismatch,
+    onClose: () => setAcceptBidMismatch(null),
+  });
   const [actioningApp, setActioningApp] = useState<string | null>(null);
   const [proposeRevisionOpen, setProposeRevisionOpen] = useState(false);
   const [recentlyApprovedMilestoneId, setRecentlyApprovedMilestoneId] = useState<
@@ -102,90 +319,103 @@ export default function JobDetailClient() {
   >(null);
   const [extendDeadlineDate, setExtendDeadlineDate] = useState<Record<string, string>>({});
   const [pendingOnChainAction, setPendingOnChainAction] = useState<PendingOnChainAction | null>(null);
+  const [pendingConfirmations, setPendingConfirmations] = useState<Record<string, PendingConfirmation>>({});
   const [selectedPaymentToken, setSelectedPaymentToken] = useState<(typeof PAYMENT_TOKENS)[number]>("XLM");
+  const [approveMilestoneModalId, setApproveMilestoneModalId] = useState<string | null>(null);
 
   const isClient = Boolean(job && address === job.client.walletAddress);
 
   const fetchJob = useCallback(async () => {
-    try {
-      const token = localStorage.getItem("token");
-      setHasApplied(false);
-
-      const res = await axios.get(`${API_URL}/jobs/${id}`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-      });
-      setJob(res.data);
-
-      setReviewsLoading(true);
-      try {
-        const reviewsRes = await axios.get<PaginatedResponse<Review>>(
-          `${API_URL}/reviews`,
-          {
-            params: { jobId: id, page: 1, limit: 50 },
-            headers: token ? { Authorization: `Bearer ${token}` } : {},
-          },
-        );
-        setReviews(reviewsRes.data.data ?? []);
-      } catch {
-        setReviews([]);
-      } finally {
-        setReviewsLoading(false);
-      }
-
-      if (token && user?.role === "FREELANCER") {
-        try {
-          const appsRes = await axios.get<PaginatedResponse<Application>>(
-            `${API_URL}/applications`,
-            {
-              params: { jobId: id, freelancerId: user.id, limit: 1 },
-              headers: { Authorization: `Bearer ${token}` },
-            },
-          );
-          const applied = appsRes.data.total > 0;
-          setHasApplied(applied);
-          if (applied && appsRes.data.data[0]) {
-            setMyApplicationId(appsRes.data.data[0].id);
-          }
-        } catch {
-          setHasApplied(false);
-          setMyApplicationId(null);
-        }
-      }
-    } catch (err: unknown) {
-      setError(
-        err instanceof Error ? err.message : "Failed to fetch job details.",
-      );
-    } finally {
-      setLoading(false);
-    }
-  }, [id, user]);
-
-  useEffect(() => {
-    fetchJob();
-  }, [fetchJob]);
+    await queryClient.invalidateQueries({ queryKey: ["job", id] });
+    await queryClient.invalidateQueries({ queryKey: ["reviews", id] });
+    await queryClient.invalidateQueries({ queryKey: ["application", id, user?.id] });
+  }, [queryClient, id, user?.id]);
 
   const fetchApplications = useCallback(async () => {
-    setLoadingApps(true);
+    await queryClient.invalidateQueries({ queryKey: ["applications", id] });
+  }, [queryClient, id]);
+
+  // Restore any in-flight confirmations from localStorage on mount so page
+  // reloads after a successful broadcast still show the retry banner.
+  useEffect(() => {
     try {
-      const token = localStorage.getItem("token");
-      const res = await axios.get<{ data: Application[] }>(
-        `${API_URL}/jobs/${id as string}/applications`,
-        { headers: token ? { Authorization: `Bearer ${token}` } : {} },
-      );
-      setApplications(res.data.data ?? []);
+      const prefix = `sm_pending_confirm_${String(id)}:`;
+      const restored: Record<string, PendingConfirmation> = {};
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (!key?.startsWith(prefix)) continue;
+        const raw = localStorage.getItem(key);
+        if (!raw) continue;
+        const conf = JSON.parse(raw) as PendingConfirmation;
+        restored[confirmActionKey(conf.confirmType, conf.milestoneId)] = conf;
+      }
+      if (Object.keys(restored).length > 0) setPendingConfirmations(restored);
     } catch {
-      setApplications([]);
-    } finally {
-      setLoadingApps(false);
+      // localStorage unavailable or malformed — ignore
     }
   }, [id]);
 
-  // Fetch applicants once job loads and current user is the owner
-  useEffect(() => {
-    if (job && user && user.id === job.client.id) {
-      void fetchApplications();
+  const savePendingConfirmation = useCallback((conf: PendingConfirmation) => {
+    try {
+      const storageKey = `sm_pending_confirm_${String(id)}:${confirmActionKey(conf.confirmType, conf.milestoneId)}`;
+      localStorage.setItem(storageKey, JSON.stringify(conf));
+    } catch {
+      // localStorage unavailable — in-memory state is the fallback
     }
-  }, [job, user, fetchApplications]);
+    const actionKey = confirmActionKey(conf.confirmType, conf.milestoneId);
+    setPendingConfirmations((prev) => ({ ...prev, [actionKey]: conf }));
+  }, [id]);
+
+  const clearPendingConfirmation = useCallback(
+    (confirmType: PendingOnChainAction["confirmType"], milestoneId?: string) => {
+      try {
+        const storageKey = `sm_pending_confirm_${String(id)}:${confirmActionKey(confirmType, milestoneId)}`;
+        localStorage.removeItem(storageKey);
+      } catch {
+        // ignore
+      }
+      const actionKey = confirmActionKey(confirmType, milestoneId);
+      setPendingConfirmations((prev) => {
+        const next = { ...prev };
+        delete next[actionKey];
+        return next;
+      });
+    },
+    [id],
+  );
+
+  const retryConfirmation = useCallback(async (conf: PendingConfirmation) => {
+    setError(null);
+    setProcessing(true);
+    try {
+      const token = localStorage.getItem("stellarmarket_jwt") ?? localStorage.getItem("token");
+      await axios.post(
+        `${API_URL}/escrow/confirm-tx`,
+        {
+          hash: conf.hash,
+          type: conf.confirmType,
+          jobId: id,
+          milestoneId: conf.milestoneId,
+          newDeadline: conf.newDeadline,
+          onChainJobId: conf.onChainJobId,
+        },
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      clearPendingConfirmation(conf.confirmType, conf.milestoneId);
+      await fetchJob();
+      if (conf.confirmType === "APPROVE_MILESTONE" && conf.milestoneId) {
+        setRecentlyApprovedMilestoneId(conf.milestoneId);
+      }
+    } catch (err: unknown) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Confirmation retry failed. Please try again.",
+      );
+    } finally {
+      setProcessing(false);
+    }
+  }, [id, clearPendingConfirmation, fetchJob]);
 
   const handleApplicationStatus = async (
     appId: string,
@@ -193,7 +423,7 @@ export default function JobDetailClient() {
   ) => {
     setActioningApp(appId);
     try {
-      const token = localStorage.getItem("token");
+      const token = localStorage.getItem("stellarmarket_jwt") ?? localStorage.getItem("token");
       await axios.put(
         `${API_URL}/applications/${appId}/status`,
         { status },
@@ -271,6 +501,27 @@ export default function JobDetailClient() {
     }
   };
 
+  const rebuildXdrForAction = async (
+    action: PendingOnChainAction,
+    authToken: string | null,
+  ): Promise<string> => {
+    const endpoint = CONFIRM_TYPE_ENDPOINT[action.confirmType];
+    if (!endpoint) {
+      throw new Error("This action cannot be automatically retried.");
+    }
+    const payload: Record<string, unknown> =
+      action.confirmType === "FUND_JOB"
+        ? { jobId: id, paymentToken: selectedPaymentToken }
+        : action.confirmType === "APPROVE_MILESTONE"
+          ? { milestoneId: action.milestoneId }
+          : { jobId: id };
+
+    const res = await axios.post(`${API_URL}${endpoint}`, payload, {
+      headers: { Authorization: `Bearer ${authToken}` },
+    });
+    return res.data.xdr;
+  };
+
   const confirmPendingOnChainAction = async (preparedXdr: string) => {
     if (!pendingOnChainAction) return;
 
@@ -282,9 +533,29 @@ export default function JobDetailClient() {
     }
 
     try {
-      const token = localStorage.getItem("token");
-      const txResult = await signAndBroadcastTransaction(preparedXdr);
+      const token = localStorage.getItem("stellarmarket_jwt") ?? localStorage.getItem("token");
+      const txType = MONEY_MOVING_TX_TYPE[action.confirmType];
+      const meta = txType
+        ? { type: txType, jobId: String(id), milestoneId: action.milestoneId }
+        : undefined;
 
+      let xdrToSend = preparedXdr;
+      let txResult = await signAndBroadcastTransaction(xdrToSend, meta);
+
+      if (!txResult.success && txResult.canRetry && meta) {
+        // Transaction's ledger deadline passed before it was included — the
+        // original sequence number is no longer usable. Rebuild against the
+        // same init endpoint (which always fetches the account's current
+        // sequence number) and resubmit once.
+        xdrToSend = await rebuildXdrForAction(action, token);
+        txResult = await signAndBroadcastTransaction(xdrToSend, meta);
+      }
+
+      if (txResult.status === "STALE_SESSION") {
+        throw new Error(
+          "Wallet changed while the transaction was processing. No job update was confirmed.",
+        );
+      }
       if (!txResult.success) {
         throw new Error(txResult.error || "Transaction failed");
       }
@@ -301,6 +572,18 @@ export default function JobDetailClient() {
         onChainJobId = parseJobIdFromResult(txResult.resultXdr);
       }
 
+      // Broadcast succeeded — close the XDR modal immediately and persist the
+      // hash before the fallible backend call.  If confirm-tx fails, the retry
+      // banner lets the user confirm the same hash without re-broadcasting.
+      savePendingConfirmation({
+        hash: txResult.hash!,
+        confirmType: action.confirmType,
+        milestoneId: action.milestoneId,
+        newDeadline: action.newDeadline,
+        onChainJobId,
+      });
+      setPendingOnChainAction(null);
+
       await axios.post(
         `${API_URL}/escrow/confirm-tx`,
         {
@@ -316,7 +599,7 @@ export default function JobDetailClient() {
         },
       );
 
-      setPendingOnChainAction(null);
+      clearPendingConfirmation(action.confirmType, action.milestoneId);
       await fetchJob();
 
       if (
@@ -326,11 +609,30 @@ export default function JobDetailClient() {
         setRecentlyApprovedMilestoneId(action.milestoneId);
       }
 
+      if (
+        action.confirmType === "SUBMIT_MILESTONE" &&
+        action.milestoneId &&
+        job
+      ) {
+        const milestoneIndex = job.milestones.findIndex(
+          (milestone) => milestone.id === action.milestoneId,
+        );
+        if (milestoneIndex !== -1) {
+          window.localStorage.removeItem(
+            getMilestoneDraftKey(job.id, milestoneIndex),
+          );
+        }
+      }
+
       if (action.confirmType === "PROPOSE_REVISION") {
         setProposeRevisionOpen(false);
       }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Action failed.");
+      // If pendingConfirmation was saved (broadcast succeeded), the XDR modal
+      // is already closed and the retry banner guides the user.
+      // If broadcast failed, pendingConfirmation was never set and the modal
+      // remains open so the user can try signing again.
     } finally {
       setConfirmingMilestoneId(null);
       setProcessing(false);
@@ -351,7 +653,7 @@ export default function JobDetailClient() {
     setError(null);
 
     try {
-      const token = localStorage.getItem("token");
+      const token = localStorage.getItem("stellarmarket_jwt") ?? localStorage.getItem("token");
       let endpoint = "";
       let payload: Record<string, unknown> = { jobId: id };
       let type: PendingOnChainAction["confirmType"] = "CREATE_JOB";
@@ -427,9 +729,29 @@ export default function JobDetailClient() {
           action === "extend-deadline" && milestoneId
             ? extendDeadlineDate[milestoneId]
             : undefined,
+        rateInfo:
+          action === "fund" && res.data.agreedValueStroops
+            ? {
+                agreedValueStroops: String(res.data.agreedValueStroops),
+                maxSlippageBps: Number(res.data.maxSlippageBps ?? 0),
+              }
+            : undefined,
       });
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Action failed.");
+      // Surface the contract's exchange-rate parity failures with their detail.
+      if (axios.isAxiosError(err) && err.response?.data?.error === "InsufficientValue") {
+        setError(
+          err.response.data.message ??
+            "The deposit is worth less than the agreed job value at the current exchange rate.",
+        );
+      } else if (axios.isAxiosError(err) && err.response?.data?.error === "OracleUnavailable") {
+        setError(
+          err.response.data.message ??
+            "The exchange-rate oracle is currently unavailable. Try again shortly.",
+        );
+      } else {
+        setError(err instanceof Error ? err.message : "Action failed.");
+      }
     }
   };
 
@@ -437,7 +759,7 @@ export default function JobDetailClient() {
     setError(null);
     setProcessing(true);
     try {
-      const token = localStorage.getItem("token");
+      const token = localStorage.getItem("stellarmarket_jwt") ?? localStorage.getItem("token");
       await axios.patch(
         `${API_URL}/jobs/${id}/complete`,
         {},
@@ -512,32 +834,63 @@ export default function JobDetailClient() {
         throw new Error("Please log in again.");
       }
 
-      const res = await axios.put(
-        `${API_URL}/milestones/${milestoneId}/approve`,
-        {},
-        { headers: { Authorization: `Bearer ${token}` } },
-      );
+      const fetchApproveXdr = async () => {
+        const r = await axios.put(
+          `${API_URL}/milestones/${milestoneId}/approve`,
+          {},
+          { headers: { Authorization: `Bearer ${token}` } },
+        );
+        return r.data.xdr as string;
+      };
 
-      const txResult = await signAndBroadcastTransaction(res.data.xdr);
+      const meta = { type: "RELEASE" as const, jobId: String(id), milestoneId };
+      let xdrToSend = await fetchApproveXdr();
+      let txResult = await signAndBroadcastTransaction(xdrToSend, meta);
+
+      if (!txResult.success && txResult.canRetry) {
+        xdrToSend = await fetchApproveXdr();
+        txResult = await signAndBroadcastTransaction(xdrToSend, meta);
+      }
+
+      if (txResult.status === "STALE_SESSION") {
+        throw new Error(
+          "Wallet changed while the milestone transaction was processing. The milestone was not confirmed.",
+        );
+      }
       if (!txResult.success) {
         throw new Error(txResult.error || "Transaction failed");
       }
 
-      await axios.post(
-        `${API_URL}/escrow/confirm-tx`,
-        {
-          hash: txResult.hash,
-          type: "APPROVE_MILESTONE",
-          jobId: id,
-          milestoneId,
-        },
-        { headers: { Authorization: `Bearer ${token}` } },
-      );
+      // Broadcast succeeded — save the hash before the fallible backend call
+      // so a confirm-tx failure can be retried without re-broadcasting.
+      savePendingConfirmation({
+        hash: txResult.hash!,
+        confirmType: "APPROVE_MILESTONE",
+        milestoneId,
+      });
 
-      await fetchJob();
-      setRecentlyApprovedMilestoneId(milestoneId);
+      try {
+        await axios.post(
+          `${API_URL}/escrow/confirm-tx`,
+          { hash: txResult.hash, type: "APPROVE_MILESTONE", jobId: id, milestoneId },
+          { headers: { Authorization: `Bearer ${token}` } },
+        );
+        clearPendingConfirmation("APPROVE_MILESTONE", milestoneId);
+        await fetchJob();
+        setRecentlyApprovedMilestoneId(milestoneId);
+      } catch (confirmErr: unknown) {
+        // The on-chain release already succeeded. Never roll back the milestone
+        // status — the retry banner guides the user to re-confirm with the same
+        // hash without re-broadcasting.
+        setError(
+          confirmErr instanceof Error
+            ? confirmErr.message
+            : "Transaction confirmed on-chain but the server has not recorded it yet. Use the retry button above to complete confirmation.",
+        );
+      }
     } catch (err: unknown) {
-      // Roll back optimistic milestone status if on-chain confirmation fails.
+      // Broadcast failed — safe to revert the optimistic update since nothing
+      // moved on-chain.
       setJob((prev) =>
         prev
           ? {
@@ -551,7 +904,7 @@ export default function JobDetailClient() {
                           ?.status ?? m.status,
                     }
                   : m,
-                ),
+              ),
             }
           : prev,
       );
@@ -562,7 +915,6 @@ export default function JobDetailClient() {
       setConfirmingMilestoneId(null);
       setActioningMilestoneId(null);
     }
-    await handleEscrowAction("approve", milestoneId);
   };
 
   const handleRevisionEscrow = async (
@@ -571,7 +923,7 @@ export default function JobDetailClient() {
   ) => {
     setError(null);
     try {
-      const token = localStorage.getItem("token");
+      const token = localStorage.getItem("stellarmarket_jwt") ?? localStorage.getItem("token");
       let endpoint = "";
       let type: PendingOnChainAction["confirmType"] = "PROPOSE_REVISION";
       let title = "";
@@ -616,13 +968,19 @@ export default function JobDetailClient() {
   const revisionInitialMilestones =
     useMemo((): ProposeRevisionMilestoneInput[] => {
       if (!job?.milestones?.length) return [];
-      return job.milestones.map((m) => ({
-        title: m.title,
-        amount: m.amount,
-        deadline: m.contractDeadline
-          ? new Date(m.contractDeadline).toISOString()
-          : new Date(job.deadline).toISOString(),
-      }));
+      // The server-rendered `initialJob` this hydrates from is fetched
+      // without auth (SSR has no access to the client's token), so it can
+      // legitimately be the reduced public shape — which omits `deadline` —
+      // for the brief window before the authenticated client-side refetch
+      // replaces it. new Date(undefined).toISOString() throws and crashed
+      // the whole page; skip a milestone that has no valid date to fall
+      // back to instead.
+      return job.milestones.flatMap((m) => {
+        const raw = m.contractDeadline ?? job.deadline;
+        const parsed = raw ? new Date(raw) : null;
+        if (!parsed || Number.isNaN(parsed.getTime())) return [];
+        return [{ title: m.title, amount: m.amount, deadline: parsed.toISOString() }];
+      });
     }, [job]);
 
   const selectedTokenBalance = useMemo(() => {
@@ -699,6 +1057,34 @@ export default function JobDetailClient() {
         <ArrowLeft size={18} /> Back to Jobs
       </Link>
 
+      {Object.values(pendingConfirmations).map((conf) => (
+        <div
+          key={confirmActionKey(conf.confirmType, conf.milestoneId)}
+          className="mb-4 p-4 bg-theme-warning/10 border border-theme-warning/20 rounded-lg flex items-start gap-3"
+        >
+          <AlertCircle className="flex-shrink-0 mt-0.5 text-theme-warning" size={18} />
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-medium text-theme-heading">
+              {CONFIRM_TYPE_LABEL[conf.confirmType] ?? conf.confirmType} — confirmation pending
+            </p>
+            <p className="text-sm text-theme-text mt-1">
+              The transaction was broadcast to the Stellar network but the server has not yet
+              recorded the result. The on-chain action may already be complete. Retry to sync
+              without re-signing or re-broadcasting.
+            </p>
+          </div>
+          <button
+            type="button"
+            disabled={processing}
+            onClick={() => void retryConfirmation(conf)}
+            className="flex-shrink-0 btn-primary text-sm py-1.5 px-4 flex items-center gap-2"
+          >
+            {processing ? <Loader2 className="animate-spin" size={14} /> : null}
+            Retry
+          </button>
+        </div>
+      ))}
+
       {error && (
         <div className="mb-6 p-4 bg-theme-error/10 border border-theme-error/20 rounded-lg flex items-start gap-3 text-theme-error">
           <AlertCircle className="flex-shrink-0 mt-0.5" size={18} />
@@ -716,7 +1102,38 @@ export default function JobDetailClient() {
         onConfirm={async (preparedXdr) => {
           await confirmPendingOnChainAction(preparedXdr);
         }}
+        extraContent={
+          pendingOnChainAction?.rateInfo ? (
+            <DepositRateInfo
+              agreedValueStroops={pendingOnChainAction.rateInfo.agreedValueStroops}
+              maxSlippageBps={pendingOnChainAction.rateInfo.maxSlippageBps}
+            />
+          ) : undefined
+        }
       />
+
+      {(() => {
+        const pendingMilestone = approveMilestoneModalId
+          ? job.milestones.find((m) => m.id === approveMilestoneModalId)
+          : null;
+        return (
+          <ApproveMilestoneModal
+            isOpen={Boolean(pendingMilestone)}
+            milestoneTitle={pendingMilestone?.title ?? ""}
+            milestoneAmount={pendingMilestone?.amount ?? 0}
+            freelancerName={job.freelancer?.username ?? job.freelancer?.walletAddress ?? "Freelancer"}
+            milestoneDescription={pendingMilestone?.description ?? ""}
+            isLoading={Boolean(approveMilestoneModalId && actioningMilestoneId === approveMilestoneModalId)}
+            onClose={() => setApproveMilestoneModalId(null)}
+            onConfirm={() => {
+              if (approveMilestoneModalId) {
+                setApproveMilestoneModalId(null);
+                void handleApproveMilestone(approveMilestoneModalId);
+              }
+            }}
+          />
+        );
+      })()}
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
         {/* Main Content */}
@@ -731,8 +1148,11 @@ export default function JobDetailClient() {
             </div>
           </div>
 
-          <h1 className="text-3xl font-bold text-theme-heading mb-4">
+          <h1 className="text-3xl font-bold text-theme-heading mb-4 flex items-center gap-3">
             {job.title}
+            {isJobFetching && (
+              <Loader2 className="animate-spin text-theme-text/50" size={20} aria-label="Refreshing data" />
+            )}
           </h1>
 
           <div className="flex flex-wrap items-center gap-4 mb-8">
@@ -763,7 +1183,7 @@ export default function JobDetailClient() {
               >
                 {job.category}
               </Link>
-              {job.skills.map((skill) => (
+              {(job.skills ?? []).map((skill) => (
                 <Link
                   key={skill}
                   href={`/jobs?skills=${encodeURIComponent(skill)}`}
@@ -866,7 +1286,7 @@ export default function JobDetailClient() {
               actioningMilestoneId={actioningMilestoneId}
               recentlyApprovedMilestoneId={recentlyApprovedMilestoneId}
               onSubmitMilestone={(milestoneId) => void handleSubmitMilestone(milestoneId)}
-              onApproveMilestone={(milestoneId) => void handleApproveMilestone(milestoneId)}
+              onApproveMilestone={(milestoneId) => setApproveMilestoneModalId(milestoneId)}
               onRequestRevision={(milestoneId) =>
                 void handleUpdateMilestoneStatus(milestoneId, "REJECTED")
               }
@@ -924,18 +1344,11 @@ export default function JobDetailClient() {
                   >
                     <div className="flex items-start justify-between gap-3">
                       <div className="flex items-center gap-3">
-                        <div className="w-9 h-9 rounded-full bg-gradient-to-br from-stellar-blue to-stellar-purple flex items-center justify-center text-white text-sm font-bold overflow-hidden">
-                          {review.reviewer.avatarUrl ? (
-                            // eslint-disable-next-line @next/next/no-img-element
-                            <img
-                              src={review.reviewer.avatarUrl}
-                              alt={review.reviewer.username}
-                              className="w-full h-full object-cover"
-                            />
-                          ) : (
-                            review.reviewer.username.charAt(0).toUpperCase()
-                          )}
-                        </div>
+                        <Avatar
+                          src={review.reviewer.avatarUrl}
+                          alt={review.reviewer.username}
+                          size={36}
+                        />
                         <div>
                           <div className="text-sm font-medium text-theme-heading">
                             {review.reviewer.username}
@@ -972,9 +1385,16 @@ export default function JobDetailClient() {
           {/* Applicants — visible to owning client only */}
           {isOwnJob && (
             <div className="card mt-8">
-              <h2 className="text-lg font-semibold text-theme-heading mb-4">
-                Applicants
-              </h2>
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-lg font-semibold text-theme-heading">
+                  Applicants
+                </h2>
+                {!loadingApps && totalApplications > 0 && (
+                  <span className="text-sm text-theme-text" data-testid="applicants-count">
+                    Showing {applications.length} of {totalApplications} applications
+                  </span>
+                )}
+              </div>
               {loadingApps ? (
                 <div className="flex justify-center py-8">
                   <Loader2
@@ -987,63 +1407,90 @@ export default function JobDetailClient() {
                   No applications yet.
                 </p>
               ) : (
-                <div className="space-y-4">
-                  {applications.map((app) => (
-                    <div
-                      key={app.id}
-                      className="flex items-center justify-between p-4 bg-theme-bg rounded-lg border border-theme-border"
-                    >
-                      <div className="flex items-center gap-3">
-                        <div className="w-9 h-9 rounded-full bg-gradient-to-br from-stellar-blue to-stellar-purple flex items-center justify-center text-white text-sm font-bold">
-                          {app.freelancer.username.charAt(0).toUpperCase()}
+                <>
+                  <div className="space-y-4">
+                    {applications.map((app) => (
+                      <div
+                        key={app.id}
+                        className="flex items-center justify-between p-4 bg-theme-bg rounded-lg border border-theme-border"
+                      >
+                        <div className="flex items-center gap-3">
+                          <Avatar
+                            src={app.freelancer.avatarUrl}
+                            alt={app.freelancer.username}
+                            size={36}
+                          />
+                          <div>
+                            <p className="font-medium text-theme-heading text-sm">
+                              {app.freelancer.username}
+                            </p>
+                            <p className="text-xs text-theme-text">
+                              Bid: {app.bidAmount.toLocaleString()} XLM
+                            </p>
+                          </div>
                         </div>
-                        <div>
-                          <p className="font-medium text-theme-heading text-sm">
-                            {app.freelancer.username}
-                          </p>
-                          <p className="text-xs text-theme-text">
-                            Bid: {app.bidAmount.toLocaleString()} XLM
-                          </p>
+                        <div className="flex items-center gap-2">
+                          <StatusBadge status={app.status} />
+                          {app.status === "PENDING" && (
+                            <>
+                              <button
+                                disabled={actioningApp === app.id}
+                                onClick={() =>
+                                  app.bidAmount !== job.budget
+                                    ? setAcceptBidMismatch({
+                                        appId: app.id,
+                                        freelancerName: app.freelancer.username,
+                                        bidAmount: app.bidAmount,
+                                      })
+                                    : void handleApplicationStatus(app.id, "ACCEPTED")
+                                }
+                                className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded-lg bg-theme-success/10 text-theme-success hover:bg-theme-success/20 transition-colors disabled:opacity-50"
+                              >
+                                {actioningApp === app.id ? (
+                                  <Loader2 size={12} className="animate-spin" />
+                                ) : (
+                                  <UserCheck size={12} />
+                                )}
+                                Accept
+                              </button>
+                              <button
+                                disabled={actioningApp === app.id}
+                                onClick={() =>
+                                  void handleApplicationStatus(app.id, "REJECTED")
+                                }
+                                className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded-lg bg-theme-error/10 text-theme-error hover:bg-theme-error/20 transition-colors disabled:opacity-50"
+                              >
+                                {actioningApp === app.id ? (
+                                  <Loader2 size={12} className="animate-spin" />
+                                ) : (
+                                  <XCircle size={12} />
+                                )}
+                                Reject
+                              </button>
+                            </>
+                          )}
                         </div>
                       </div>
-                      <div className="flex items-center gap-2">
-                        <StatusBadge status={app.status} />
-                        {app.status === "PENDING" && (
-                          <>
-                            <button
-                              disabled={actioningApp === app.id}
-                              onClick={() =>
-                                void handleApplicationStatus(app.id, "ACCEPTED")
-                              }
-                              className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded-lg bg-theme-success/10 text-theme-success hover:bg-theme-success/20 transition-colors disabled:opacity-50"
-                            >
-                              {actioningApp === app.id ? (
-                                <Loader2 size={12} className="animate-spin" />
-                              ) : (
-                                <UserCheck size={12} />
-                              )}
-                              Accept
-                            </button>
-                            <button
-                              disabled={actioningApp === app.id}
-                              onClick={() =>
-                                void handleApplicationStatus(app.id, "REJECTED")
-                              }
-                              className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded-lg bg-theme-error/10 text-theme-error hover:bg-theme-error/20 transition-colors disabled:opacity-50"
-                            >
-                              {actioningApp === app.id ? (
-                                <Loader2 size={12} className="animate-spin" />
-                              ) : (
-                                <XCircle size={12} />
-                              )}
-                              Reject
-                            </button>
-                          </>
+                    ))}
+                  </div>
+                  {hasNextPage && (
+                    <div className="mt-4 flex justify-center">
+                      <button
+                        data-testid="load-more-applications"
+                        onClick={() => void fetchNextPage()}
+                        disabled={isFetchingNextPage}
+                        className="btn-secondary flex items-center gap-2 px-4 py-2 text-sm disabled:opacity-50"
+                      >
+                        {isFetchingNextPage ? (
+                          <Loader2 size={14} className="animate-spin" />
+                        ) : (
+                          <ChevronDown size={14} />
                         )}
-                      </div>
+                        Load more
+                      </button>
                     </div>
-                  ))}
-                </div>
+                  )}
+                </>
               )}
             </div>
           )}
@@ -1098,59 +1545,64 @@ export default function JobDetailClient() {
               </div>
 
               <div className="mt-4 space-y-2">
-                <div className="rounded-xl border border-theme-border bg-theme-bg/60 p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <p className="text-[10px] uppercase tracking-[0.24em] text-theme-text-muted">
-                        Payment token
-                      </p>
-                      <h4 className="mt-1 text-sm font-semibold text-theme-heading">
-                        Choose your escrow asset
-                      </h4>
+                {/* Only the client ever acts on this — a freelancer has no
+                    business seeing "their" wallet balance weighed against a
+                    "Required" amount they're not the one depositing. */}
+                {isClient && (
+                  <div className="rounded-xl border border-theme-border bg-theme-bg/60 p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-[10px] uppercase tracking-[0.24em] text-theme-text-muted">
+                          Payment token
+                        </p>
+                        <h4 className="mt-1 text-sm font-semibold text-theme-heading">
+                          Choose your escrow asset
+                        </h4>
+                      </div>
+                      <div className="flex items-center gap-2 text-xs text-theme-text">
+                        <span className="rounded-full border border-theme-border px-2 py-1">
+                          1 XLM ≈ 1 USDC
+                        </span>
+                      </div>
                     </div>
-                    <div className="flex items-center gap-2 text-xs text-theme-text">
+
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {PAYMENT_TOKENS.map((token) => (
+                        <button
+                          key={token}
+                          type="button"
+                          onClick={() => setSelectedPaymentToken(token)}
+                          className={`rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${
+                            selectedPaymentToken === token
+                              ? "border-stellar-blue bg-stellar-blue/10 text-stellar-blue"
+                              : "border-theme-border bg-theme-card text-theme-text hover:border-stellar-blue hover:text-stellar-blue"
+                          }`}
+                        >
+                          {token}
+                        </button>
+                      ))}
+                    </div>
+
+                    <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-theme-text">
+                      <span>
+                        Wallet balance: {selectedTokenBalance.toLocaleString(undefined, {
+                          maximumFractionDigits: 2,
+                        })} {selectedPaymentToken}
+                      </span>
                       <span className="rounded-full border border-theme-border px-2 py-1">
-                        1 XLM ≈ 1 USDC
+                        Required: {selectedTokenAmount.toLocaleString(undefined, {
+                          maximumFractionDigits: 2,
+                        })} {selectedPaymentToken}
                       </span>
                     </div>
-                  </div>
 
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    {PAYMENT_TOKENS.map((token) => (
-                      <button
-                        key={token}
-                        type="button"
-                        onClick={() => setSelectedPaymentToken(token)}
-                        className={`rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${
-                          selectedPaymentToken === token
-                            ? "border-stellar-blue bg-stellar-blue/10 text-stellar-blue"
-                            : "border-theme-border bg-theme-card text-theme-text hover:border-stellar-blue hover:text-stellar-blue"
-                        }`}
-                      >
-                        {token}
-                      </button>
-                    ))}
+                    {!hasSufficientSelectedTokenBalance && (
+                      <p className="mt-2 text-xs text-theme-error">
+                        Insufficient {selectedPaymentToken} balance for this escrow deposit.
+                      </p>
+                    )}
                   </div>
-
-                  <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-theme-text">
-                    <span>
-                      Wallet balance: {selectedTokenBalance.toLocaleString(undefined, {
-                        maximumFractionDigits: 2,
-                      })} {selectedPaymentToken}
-                    </span>
-                    <span className="rounded-full border border-theme-border px-2 py-1">
-                      Required: {selectedTokenAmount.toLocaleString(undefined, {
-                        maximumFractionDigits: 2,
-                      })} {selectedPaymentToken}
-                    </span>
-                  </div>
-
-                  {!hasSufficientSelectedTokenBalance && (
-                    <p className="mt-2 text-xs text-theme-error">
-                      Insufficient {selectedPaymentToken} balance for this escrow deposit.
-                    </p>
-                  )}
-                </div>
+                )}
 
                 {isClient &&
                   !job.contractJobId &&
@@ -1309,27 +1761,33 @@ export default function JobDetailClient() {
               )}
           </div>
 
-          <div className="card">
-            <h3 className="font-semibold text-theme-heading mb-4">
-              About the Client
-            </h3>
-            <div className="flex items-center gap-3 mb-3">
-              <div className="w-10 h-10 rounded-full bg-gradient-to-br from-stellar-blue to-stellar-purple" />
-              <div>
-                <div className="font-medium text-theme-heading">
-                  {job.client.username}
+          {!isOwnJob && (
+            <div className="card">
+              <h3 className="font-semibold text-theme-heading mb-4">
+                About the Client
+              </h3>
+              <div className="flex items-center gap-3 mb-3">
+                <Avatar
+                  src={job.client.avatarUrl}
+                  alt={job.client.username}
+                  size={40}
+                />
+                <div>
+                  <div className="font-medium text-theme-heading">
+                    {job.client.username}
+                  </div>
+                  <WalletAddress address={job.client.walletAddress} />
                 </div>
-                <WalletAddress address={job.client.walletAddress} />
               </div>
+              <p className="text-sm text-theme-text mb-4">{job.client.bio}</p>
+              <Link
+                href={`/messages/${job.client.id}-${job.id}`}
+                className="btn-secondary w-full flex items-center justify-center gap-2"
+              >
+                <MessageSquare size={18} /> Message Client
+              </Link>
             </div>
-            <p className="text-sm text-theme-text mb-4">{job.client.bio}</p>
-            <Link
-              href={`/messages/${job.client.id}-${job.id}`}
-              className="btn-secondary w-full flex items-center justify-center gap-2"
-            >
-              <MessageSquare size={18} /> Message Client
-            </Link>
-          </div>
+          )}
         </div>
       </div>
 
@@ -1387,7 +1845,7 @@ export default function JobDetailClient() {
       {/* Withdraw Application confirmation dialog */}
       {withdrawConfirmOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
-          <div className="bg-theme-card border border-theme-border rounded-xl shadow-2xl w-full max-w-md p-6">
+          <div ref={withdrawConfirmRef} className="bg-theme-card border border-theme-border rounded-xl shadow-2xl w-full max-w-md p-6">
             <h2 className="text-lg font-semibold text-theme-heading mb-2">
               Withdraw Application?
             </h2>
@@ -1420,6 +1878,67 @@ export default function JobDetailClient() {
           </div>
         </div>
       )}
+
+      {acceptBidMismatch && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div ref={acceptBidMismatchRef} className="bg-theme-card border border-theme-border rounded-xl shadow-2xl w-full max-w-md p-6">
+            <h2 className="text-lg font-semibold text-theme-heading mb-2">
+              Bid doesn&apos;t match this job&apos;s budget
+            </h2>
+            <p className="text-sm text-theme-text mb-6">
+              <span className="font-medium text-theme-heading">{acceptBidMismatch.freelancerName}</span>{" "}
+              proposed{" "}
+              <span className="font-medium text-theme-heading">
+                {acceptBidMismatch.bidAmount.toLocaleString()} XLM
+              </span>
+              , but this job&apos;s milestones still total{" "}
+              <span className="font-medium text-theme-heading">{job.budget.toLocaleString()} XLM</span>.
+              Accepting won&apos;t change that — the freelancer will only ever be paid out{" "}
+              {job.budget.toLocaleString()} XLM through this job&apos;s milestones. If you agreed to their
+              rate, message them to confirm before accepting, or update the milestone amounts to match
+              first.
+            </p>
+            <div className="flex gap-3 justify-end">
+              <button
+                onClick={() => setAcceptBidMismatch(null)}
+                className="btn-secondary"
+                disabled={actioningApp === acceptBidMismatch.appId}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  const appId = acceptBidMismatch.appId;
+                  setAcceptBidMismatch(null);
+                  await handleApplicationStatus(appId, "ACCEPTED");
+                }}
+                disabled={actioningApp === acceptBidMismatch.appId}
+                className="flex items-center gap-2 px-4 py-2 rounded-lg bg-theme-success text-white text-sm font-medium hover:bg-theme-success/90 transition-colors disabled:opacity-50"
+              >
+                {actioningApp === acceptBidMismatch.appId ? (
+                  <Loader2 size={14} className="animate-spin" />
+                ) : null}
+                Accept at {job.budget.toLocaleString()} XLM anyway
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Sticky Apply bar — mobile only, freelancers, open jobs not yet applied */}
+      {user?.role === "FREELANCER" &&
+        !isOwnJob &&
+        job.status === "OPEN" &&
+        !hasApplied && (
+          <div className="sm:hidden fixed bottom-0 inset-x-0 z-40 border-t border-theme-border bg-theme-card/95 px-4 py-3 backdrop-blur-sm">
+            <button
+              className="btn-primary w-full"
+              onClick={() => setApplyModalOpen(true)}
+            >
+              Apply for this Job
+            </button>
+          </div>
+        )}
     </div>
   );
 }

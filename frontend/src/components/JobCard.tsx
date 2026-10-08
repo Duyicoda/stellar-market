@@ -14,6 +14,8 @@ import StatusBadge from "./StatusBadge";
 import EscrowStatusBadge from "./EscrowStatusBadge";
 import { Job, User as UserType } from "@/types";
 import { useAuth } from "@/context/AuthContext";
+import { useRelativeTime } from "@/hooks/useRelativeTime";
+import Avatar from "@/components/Avatar";
 
 interface JobCardProps {
   job: Job;
@@ -72,6 +74,7 @@ export default function JobCard({
 }: JobCardProps) {
   const authUser = useAuth().user ?? null;
   const user = viewer ?? authUser;
+  const postedAt = useRelativeTime(new Date(job.createdAt));
   const isFreelancer = user?.role === "FREELANCER";
   const isClient = user?.role === "CLIENT";
   const isOwnJob = user?.id === job.client.id;
@@ -155,7 +158,7 @@ export default function JobCard({
           <Tag size={12} />
           {job.category}
         </button>
-        {job.skills.slice(0, 4).map((skill) => (
+        {(job.skills ?? []).slice(0, 4).map((skill) => (
           <button
             key={skill}
             type="button"
@@ -179,13 +182,17 @@ export default function JobCard({
         </div>
         <div className="flex items-center gap-1">
           <Clock size={14} />
-          <span>{new Date(job.createdAt).toLocaleDateString()}</span>
+          <span>{postedAt}</span>
         </div>
       </div>
 
       <div className="flex items-center justify-between mt-4 pt-4 border-t border-theme-border">
         <div className="flex items-center gap-2">
-          <div className="w-6 h-6 rounded-full bg-gradient-to-br from-stellar-blue to-stellar-purple" />
+          <Avatar
+            src={job.client.avatarUrl}
+            alt={job.client.username}
+            size={24}
+          />
           <span className="text-sm text-theme-text">{job.client.username}</span>
         </div>
 

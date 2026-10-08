@@ -148,6 +148,15 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 0
+                  }
+                },
+                {
+                  "u32": 0
                 }
               ]
             }
@@ -403,6 +412,12 @@
                                     }
                                   ]
                                 }
+                              },
+                              {
+                                "key": {
+                                  "symbol": "token"
+                                },
+                                "val": "void"
                               }
                             ]
                           },
@@ -454,6 +469,12 @@
                                     }
                                   ]
                                 }
+                              },
+                              {
+                                "key": {
+                                  "symbol": "token"
+                                },
+                                "val": "void"
                               }
                             ]
                           },
@@ -505,6 +526,12 @@
                                     }
                                   ]
                                 }
+                              },
+                              {
+                                "key": {
+                                  "symbol": "token"
+                                },
+                                "val": "void"
                               }
                             ]
                           }
@@ -533,6 +560,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "token_balances"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "total_amount"
                       },
                       "val": {
@@ -548,7 +583,7 @@
             },
             "ext": "v0"
           },
-          518400
+          535000
         ]
       ],
       [
@@ -593,7 +628,7 @@
             },
             "ext": "v0"
           },
-          518400
+          6311999
         ]
       ],
       [
@@ -971,7 +1006,7 @@
             },
             "ext": "v0"
           },
-          518400
+          6311999
         ]
       ]
     ]
@@ -1373,6 +1408,15 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 0
+                  }
+                },
+                {
+                  "u32": 0
                 }
               ]
             }
@@ -1551,7 +1595,7 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
               },
               {
-                "symbol": "claim_expired"
+                "symbol": "expire_job"
               }
             ],
             "data": {
@@ -1574,12 +1618,12 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "claim_expired"
+                "symbol": "expire_job"
               }
             ],
             "data": {
               "error": {
-                "contract": 40
+                "contract": 26
               }
             }
           }
@@ -1600,7 +1644,7 @@
               },
               {
                 "error": {
-                  "contract": 40
+                  "contract": 26
                 }
               }
             ],
@@ -1625,7 +1669,7 @@
               },
               {
                 "error": {
-                  "contract": 40
+                  "contract": 26
                 }
               }
             ],
@@ -1635,7 +1679,7 @@
                   "string": "contract call failed"
                 },
                 {
-                  "symbol": "claim_expired"
+                  "symbol": "expire_job"
                 },
                 {
                   "vec": [
@@ -1664,7 +1708,7 @@
               },
               {
                 "error": {
-                  "contract": 40
+                  "contract": 26
                 }
               }
             ],

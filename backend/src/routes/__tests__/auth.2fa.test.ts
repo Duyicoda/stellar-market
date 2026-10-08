@@ -6,11 +6,11 @@ import { config } from "../../config";
 
 // ─── otplib mock ─────────────────────────────────────────────────────────────
 const MOCK_SECRET = "JBSWY3DPEHPK3PXP";
-let mockTotpCode = "123456";
+const mockTotpCode = "123456";
 jest.mock("otplib", () => ({
   generateSecret: jest.fn(() => MOCK_SECRET),
   generateSync: jest.fn(() => mockTotpCode),
-  verifySync: jest.fn(({ token, secret }: { token: string; secret: string }) => ({
+  verifySync: jest.fn(({ token, secret: _secret }: { token: string; secret: string }) => ({
     valid: token === mockTotpCode,
     delta: 0,
   })),
@@ -268,7 +268,7 @@ describe.skip("POST /api/auth/login (2FA enabled)", () => {
     expect(res.body.user).toBeUndefined();
 
     // Verify the temp token has 2fa_pending purpose
-    const decoded = jwt.verify(res.body.tempToken, config.jwtSecret) as any;
+    const decoded = jwt.verify(res.body.tempToken, config.jwtSecret) as { purpose: string };
     expect(decoded.purpose).toBe("2fa_pending");
   });
 

@@ -1,5 +1,4 @@
 import { z } from "zod";
-import { paginationSchema } from "./common";
 
 export const getNotificationsQuerySchema = z.object({
   page: z.coerce.number().int().positive().default(1),

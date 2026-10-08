@@ -117,6 +117,15 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 0
+                  }
+                },
+                {
+                  "u32": 0
                 }
               ]
             }
@@ -185,7 +194,7 @@
                             "symbol": "deadline"
                           },
                           "val": {
-                            "u64": 1000000
+                            "u64": 999999
                           }
                         },
                         {
@@ -215,6 +224,12 @@
                               }
                             ]
                           }
+                        },
+                        {
+                          "key": {
+                            "symbol": "token"
+                          },
+                          "val": "void"
                         }
                       ]
                     },
@@ -266,6 +281,12 @@
                               }
                             ]
                           }
+                        },
+                        {
+                          "key": {
+                            "symbol": "token"
+                          },
+                          "val": "void"
                         }
                       ]
                     }
@@ -494,7 +515,7 @@
                                   "symbol": "deadline"
                                 },
                                 "val": {
-                                  "u64": 1000000
+                                  "u64": 999999
                                 }
                               },
                               {
@@ -524,6 +545,12 @@
                                     }
                                   ]
                                 }
+                              },
+                              {
+                                "key": {
+                                  "symbol": "token"
+                                },
+                                "val": "void"
                               }
                             ]
                           },
@@ -575,6 +602,12 @@
                                     }
                                   ]
                                 }
+                              },
+                              {
+                                "key": {
+                                  "symbol": "token"
+                                },
+                                "val": "void"
                               }
                             ]
                           }
@@ -603,6 +636,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "token_balances"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "total_amount"
                       },
                       "val": {
@@ -618,7 +659,7 @@
             },
             "ext": "v0"
           },
-          518400
+          535000
         ]
       ],
       [
@@ -714,6 +755,12 @@
                                         }
                                       ]
                                     }
+                                  },
+                                  {
+                                    "key": {
+                                      "symbol": "token"
+                                    },
+                                    "val": "void"
                                   }
                                 ]
                               }
@@ -835,7 +882,7 @@
                                   "symbol": "deadline"
                                 },
                                 "val": {
-                                  "u64": 1000000
+                                  "u64": 999999
                                 }
                               },
                               {
@@ -865,6 +912,12 @@
                                     }
                                   ]
                                 }
+                              },
+                              {
+                                "key": {
+                                  "symbol": "token"
+                                },
+                                "val": "void"
                               }
                             ]
                           },
@@ -916,6 +969,12 @@
                                     }
                                   ]
                                 }
+                              },
+                              {
+                                "key": {
+                                  "symbol": "token"
+                                },
+                                "val": "void"
                               }
                             ]
                           }
@@ -1084,7 +1143,7 @@
             },
             "ext": "v0"
           },
-          518400
+          6311999
         ]
       ],
       [
@@ -1528,7 +1587,7 @@
             },
             "ext": "v0"
           },
-          518400
+          6311999
         ]
       ]
     ]
@@ -1965,6 +2024,15 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 0
+                  }
+                },
+                {
+                  "u32": 0
                 }
               ]
             }
@@ -2226,7 +2294,7 @@
                             "symbol": "deadline"
                           },
                           "val": {
-                            "u64": 1000000
+                            "u64": 999999
                           }
                         },
                         {
@@ -2256,6 +2324,12 @@
                               }
                             ]
                           }
+                        },
+                        {
+                          "key": {
+                            "symbol": "token"
+                          },
+                          "val": "void"
                         }
                       ]
                     },
@@ -2307,6 +2381,12 @@
                               }
                             ]
                           }
+                        },
+                        {
+                          "key": {
+                            "symbol": "token"
+                          },
+                          "val": "void"
                         }
                       ]
                     }
@@ -2604,7 +2684,7 @@
                               "symbol": "deadline"
                             },
                             "val": {
-                              "u64": 1000000
+                              "u64": 999999
                             }
                           },
                           {
@@ -2634,6 +2714,12 @@
                                 }
                               ]
                             }
+                          },
+                          {
+                            "key": {
+                              "symbol": "token"
+                            },
+                            "val": "void"
                           }
                         ]
                       },
@@ -2685,6 +2771,12 @@
                                 }
                               ]
                             }
+                          },
+                          {
+                            "key": {
+                              "symbol": "token"
+                            },
+                            "val": "void"
                           }
                         ]
                       }
@@ -2709,6 +2801,14 @@
                   },
                   "val": {
                     "address": "CDLDVFKHEZ2RVB3NG4UQA4VPD3TSHV6XMHXMHP2BSGCJ2IIWVTOHGDSG"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "token_balances"
+                  },
+                  "val": {
+                    "vec": []
                   }
                 },
                 {

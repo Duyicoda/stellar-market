@@ -4,8 +4,9 @@ import { useState, useEffect, useCallback } from "react";
 import { useAuth } from "@/context/AuthContext";
 import { Gift, Copy, CheckCheck, Users, Star, Loader2 } from "lucide-react";
 import axios from "axios";
+import Avatar from "@/components/Avatar";
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5000/api";
+const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5000/api/v1";
 
 interface ReferralEntry {
   id: string;
@@ -21,13 +22,17 @@ interface ReferralStats {
 }
 
 export default function ReferralsPage() {
-  const { token } = useAuth();
+  const { token, isLoading: authLoading } = useAuth();
   const [stats, setStats] = useState<ReferralStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [copied, setCopied] = useState(false);
 
   const fetchStats = useCallback(async () => {
-    if (!token) return;
+    if (!token) {
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
     try {
       const res = await axios.get<ReferralStats>(`${API}/referrals/stats`, {
         headers: { Authorization: `Bearer ${token}` },
@@ -41,8 +46,10 @@ export default function ReferralsPage() {
   }, [token]);
 
   useEffect(() => {
-    void fetchStats();
-  }, [fetchStats]);
+    if (!authLoading) {
+      void fetchStats();
+    }
+  }, [authLoading, fetchStats]);
 
   const referralLink =
     typeof window !== "undefined" && stats?.referralCode
@@ -56,7 +63,7 @@ export default function ReferralsPage() {
     setTimeout(() => setCopied(false), 2000);
   };
 
-  if (loading) {
+  if (authLoading || loading) {
     return (
       <div className="flex items-center justify-center min-h-[60vh]">
         <Loader2 className="animate-spin text-stellar-blue" size={40} />
@@ -131,9 +138,11 @@ export default function ReferralsPage() {
                 className="flex items-center justify-between py-2 border-b border-theme-border last:border-b-0"
               >
                 <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-full bg-gradient-to-br from-stellar-blue to-stellar-purple flex items-center justify-center text-white font-bold text-sm">
-                    {r.username.charAt(0).toUpperCase()}
-                  </div>
+                  <Avatar
+                    src={null}
+                    alt={r.username}
+                    size={32}
+                  />
                   <span className="text-sm font-medium text-theme-heading">{r.username}</span>
                 </div>
                 <span className="text-xs text-theme-text">

@@ -20,8 +20,12 @@ export default function WalletAddress({ address, className = "" }: WalletAddress
 
   async function copyAddress() {
     if (!address) return;
-    await navigator.clipboard.writeText(address);
-    toast.success("Address copied!");
+    try {
+      await navigator.clipboard.writeText(address);
+      toast.success("Address copied!");
+    } catch {
+      toast.error("Failed to copy address. Please copy it manually.");
+    }
   }
 
   return (

@@ -2,6 +2,7 @@ import {
   validateFileMimeType,
   formatFileSize,
 } from "../../utils/fileValidation";
+import { MAX_FILE_SIZE, ALLOWED_MIME_TYPES } from "../../config/upload";
 
 describe("File Upload Utilities", () => {
   describe("validateFileMimeType", () => {
@@ -23,12 +24,10 @@ describe("File Upload Utilities", () => {
 
 describe("Upload Configuration", () => {
   it("should have correct max file size", () => {
-    const { MAX_FILE_SIZE } = require("../../config/upload");
     expect(MAX_FILE_SIZE).toBe(10 * 1024 * 1024);
   });
 
   it("should have allowed mime types", () => {
-    const { ALLOWED_MIME_TYPES } = require("../../config/upload");
     expect(ALLOWED_MIME_TYPES).toContain("application/pdf");
     expect(ALLOWED_MIME_TYPES).toContain("image/jpeg");
     expect(ALLOWED_MIME_TYPES).toContain("image/png");

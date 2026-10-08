@@ -51,7 +51,7 @@ function buildWhereSql(input: FreelancerSearchInput): Prisma.Sql {
     if (!token) continue;
     const pattern = `%${token}%`;
     parts.push(
-      Prisma.sql`EXISTS (SELECT 1 FROM unnest(u.skills) AS sk WHERE sk ILIKE ${pattern})`
+      Prisma.sql`array_to_string(u.skills, ' ') ILIKE ${pattern}`
     );
   }
 

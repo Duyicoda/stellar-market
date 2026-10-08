@@ -100,10 +100,10 @@
     @apply bg-[var(--bg-card)] border border-[var(--border)] rounded-xl p-6;
   }
   .btn-primary {
-    @apply bg-stellar-blue hover:bg-stellar-purple text-white font-medium px-6 py-3 rounded-lg transition-colors duration-200;
+    @apply bg-stellar-blue hover:bg-stellar-purple text-white font-medium px-6 py-3 rounded-lg transition-all duration-200 active:scale-95;
   }
   .btn-secondary {
-    @apply bg-[var(--bg-card)] border border-[var(--border)] hover:border-stellar-blue text-[var(--text-heading)] font-medium px-6 py-3 rounded-lg transition-colors duration-200;
+    @apply bg-[var(--bg-card)] border border-[var(--border)] hover:border-stellar-blue text-[var(--text-heading)] font-medium px-6 py-3 rounded-lg transition-all duration-200 active:scale-95;
   }
   .input-field {
     @apply bg-[var(--bg-card)] border border-[var(--border)] rounded-lg px-4 py-3 text-[var(--text-heading)] placeholder-[var(--text-muted)] focus:outline-none focus:border-stellar-blue transition-colors w-full;
@@ -117,4 +117,11 @@
   .no-transition * {
     transition: none !important;
   }
+}
+
+/* Hides the scrollbar on any .scrollbar-hide element (horizontal carousels,
+   scrollable lists). Static, so it belongs here rather than being injected
+   per-component via a <style> tag on every render (issue #1341). */
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
 }

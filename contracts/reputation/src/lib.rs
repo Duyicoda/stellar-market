@@ -1,4 +1,36 @@
 #![no_std]
+//! # Reputation contract
+//!
+//! ## Two distinct measures of standing (issue #1172)
+//!
+//! This contract exposes **two independent ladders**. They are computed from
+//! different inputs, answer different questions, and routinely disagree — a user
+//! can sit at the top of one and the bottom of the other. They are deliberately
+//! named apart so they are not mistaken for the same thing:
+//!
+//! | | **Rating tier** ([`ReputationTier`]) | **Score badge** ([`ScoreBadge`]) |
+//! |---|---|---|
+//! | Read via | [`ReputationContract::get_tier`] | [`ReputationContract::get_score_badge`] |
+//! | Computed from | `average_rating` = decayed `total_score / total_weight × 100`, multiplied by the user's stake multiplier and capped at 10,000 | raw decayed `total_score` = Σ(`rating` × per-review `stake_weight`) |
+//! | Grows with review count? | **No** — it is an average, so a 5★ user with 1 review ranks alongside a 5★ user with 100 | **Yes** — every additional review and every additional staked unit pushes it up without bound |
+//! | Rungs | None / Bronze (≥100) / Silver (≥300) / Gold (≥500) / Platinum (≥700) | None / Rising (≥100) / Established (≥500) / Elite (≥2000) |
+//! | Answers | "how well does this user perform?" | "how much proven, stake-backed history does this user have?" |
+//!
+//! Consequences worth knowing before integrating:
+//!
+//! - The two ladders have **different numbers of rungs and different thresholds**;
+//!   they are not parallel and are not meant to be. There is no "Platinum" score
+//!   badge, and a `Gold` rating tier implies nothing about the score badge.
+//! - The ladders share only the word "reputation". Do not map one onto the other,
+//!   and do not present them to users as one combined level.
+//! - [`ReputationContract::get_badges`] is a *third* thing again: it returns the
+//!   **rating tiers** ([`AwardedBadge::badge_type`] is a [`ReputationTier`]) that a
+//!   user has passed through and permanently keeps, whereas the rating tier and the
+//!   score badge are both computed live and can fall as reviews decay.
+//! - Both ladders read decayed values, so both drift downward while a user is
+//!   dormant.
+//!
+//! `get_badge` is retained as a backwards-compatible alias of `get_score_badge`.
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, String,
@@ -31,12 +63,21 @@ mod escrow {
 
     #[contracttype]
     #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct TokenBalance {
+        pub token: Address,
+        pub total_amount: i128,
+        pub funded_amount: i128,
+    }
+
+    #[contracttype]
+    #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct Milestone {
         pub id: u32,
         pub description: String,
         pub amount: i128,
         pub status: MilestoneStatus,
         pub deadline: u64,
+        pub token: Option<Address>,
     }
 
     #[contracttype]
@@ -52,6 +93,8 @@ mod escrow {
         pub milestones: Vec<Milestone>,
         pub job_deadline: u64,
         pub auto_refund_after: u64,
+        pub expiry_ledger: u32,
+        pub token_balances: Vec<TokenBalance>,
     }
 
     #[soroban_sdk::contractclient(name = "EscrowContractClient")]
@@ -90,6 +133,47 @@ pub enum ReputationError {
     AppealNotFound = 21,
     AppealAlreadyResolved = 22,
     AlreadyEndorsed = 23,
+    // Rejected when a referral bonus is recorded with a timestamp in the future.
+    // A future-dated bonus would keep `get_decay_factor` at `elapsed_seconds = 0`,
+    // permanently exempting it from decay and inflating the score (issue #781).
+    InvalidTimestamp = 24,
+    // Rejected when a decay rate exceeds the configured maximum. An unbounded
+    // decay rate (e.g. 99%) would wipe out the leaderboard in a single period
+    // and make reputation meaningless (issue #783).
+    DecayRateTooHigh = 25,
+    /// Rejected when stake_weight is below the configured minimum stake weight.
+    /// A zero-stake review carries vote weight of 1 even though the reviewer has
+    /// no economic skin in the game; the minimum stake weight floor prevents this.
+    StakeTooLow = 26,
+    /// Rejected when `endorse` is called with `endorser == target`. Without this
+    /// guard, a user with an established rating could add themselves as their
+    /// own skill endorser and inflate their own `get_skill_score` (issue #987).
+    SelfEndorsement = 27,
+    /// Rejected when `claim_stake` finds a positive `StakeBalance` but no
+    /// recorded `StakeToken` for the reviewer (stake predates token tracking).
+    StakeTokenNotFound = 28,
+    /// Rejected when `claim_stake` is called before the lockup period has
+    /// elapsed. Stake must remain locked for `STAKE_LOCKUP_SECONDS` after the
+    /// first review that deposited it, preventing flash-loan-funded governance
+    /// weight inflation where an attacker stakes, inflates reputation/governance
+    /// weight, and immediately reclaims the stake in the same block (issue #exploit).
+    StakeLockupActive = 29,
+    /// Rejected when `set_stake_tiers` is called with more tiers than
+    /// `MAX_STAKE_TIERS`. An unbounded tier list would make every call to
+    /// `get_stake_multiplier` (on the hot path for `get_average_rating`,
+    /// `get_score_badge`, and leaderboard updates) progressively more expensive,
+    /// mirroring the cap pattern used for `MAX_ENDORSERS_COUNTED`,
+    /// `MAX_REVIEWS_COUNTED`, and `MAX_REVIEWS_PER_REVIEWEE_WINDOW` (issue #1177).
+    TooManyStakeTiers = 30,
+    /// No multi-sig proposal exists for the requested `proposal_id`.
+    ///
+    /// Returned by the *lookup* paths in `approve_admin_action` and
+    /// `execute_proposal` when no proposal is stored under that id. These used to
+    /// report `NotAdmin`, which told a legitimately-authorized signer that they
+    /// were an unauthorized admin rather than that they passed a stale or
+    /// mistyped proposal id (issue #1434). Genuine authorization checks are
+    /// unaffected and still return `NotAdmin`.
+    ProposalNotFound = 31,
 }
 
 #[contracttype]
@@ -111,7 +195,10 @@ pub struct UserReputation {
     pub total_score: u64,
     pub total_weight: u64,
     pub review_count: u32,
-    pub last_updated_ledger: u32,
+    /// Unix **timestamp** (seconds) of the last score-changing event, from
+    /// `env.ledger().timestamp()` — NOT a ledger sequence number. Renamed from
+    /// `last_updated_ledger` to match what it actually holds (issue #899 review).
+    pub last_updated_ts: u32,
 }
 
 #[contracttype]
@@ -139,6 +226,14 @@ pub struct ReferralBonusRecord {
     pub timestamp: u64,
 }
 
+/// **Rating tier** — a user's standing on the *quality* ladder, derived from
+/// `average_rating` (see [`ReputationContract::get_tier`]). Independent of how many
+/// reviews a user has: it is an average, so one glowing review can reach the same
+/// tier as a hundred. Not to be confused with [`ScoreBadge`], the *volume* ladder —
+/// see the module docs for the full comparison (issue #1172).
+///
+/// Thresholds on `average_rating` (0–10,000): Bronze ≥ 100, Silver ≥ 300,
+/// Gold ≥ 500, Platinum ≥ 700.
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -150,14 +245,28 @@ pub enum ReputationTier {
     Platinum = 4,
 }
 
+/// **Score badge** — a user's standing on the *volume* ladder, derived from the raw
+/// decayed `total_score` (see [`ReputationContract::get_score_badge`]). It rises
+/// with every additional review and with the stake backing those reviews, so it
+/// measures accumulated, stake-backed history rather than quality.
+///
+/// Deliberately named apart from [`ReputationTier`] (issue #1172): the two ladders
+/// use different inputs and thresholds and frequently disagree. The rungs are
+/// intentionally not parallel to the rating tiers — there is no Platinum here, and
+/// `Elite` is the top of a three-rung ladder.
+///
+/// Thresholds on the decayed `total_score`: Rising ≥ 100, Established ≥ 500,
+/// Elite ≥ 2000. Discriminants match the previous `Badge` enum, so encoded values
+/// are unchanged: `Rising` was `Bronze`, `Established` was `Silver`, `Elite` was
+/// `Gold`.
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
-pub enum Badge {
+pub enum ScoreBadge {
     None = 0,
-    Bronze = 1,
-    Silver = 2,
-    Gold = 3,
+    Rising = 1,
+    Established = 2,
+    Elite = 3,
 }
 
 #[contracttype]
@@ -169,9 +278,17 @@ pub enum DisputeOutcome {
     MaliciousFiling = 2,
 }
 
+/// A **rating tier** the user has reached at least once, kept permanently.
+///
+/// Despite the name, this has nothing to do with [`ScoreBadge`]: `badge_type` is a
+/// [`ReputationTier`], awarded by `submit_review` when a user first crosses a tier
+/// threshold. Unlike the two live ladders it never falls back — decay can lower a
+/// user's current tier and score badge while these awarded records stay (issue
+/// #1172).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AwardedBadge {
+    /// The rating tier that was reached — **not** a [`ScoreBadge`].
     pub badge_type: ReputationTier,
     pub awarded_at: u64,
 }
@@ -242,8 +359,10 @@ enum DataKey {
     Reviews(Address),
     ReviewExists(Address, Address, u64),
     Badges(Address),
-    Admin, // Legacy
     DecayRate,
+    // Configurable upper bound for `DecayRate`, settable by a super-admin up to
+    // `MAX_DECAY_RATE_HARD_CEILING`. Falls back to `MAX_DECAY_RATE` when unset.
+    MaxDecayRate,
     MinStake,
     RateLimit,
     LastReviewLedger(Address),
@@ -260,11 +379,28 @@ enum DataKey {
     MultiSigProposalCount,
     Leaderboard,
     StakeBalance(Address),
+    /// The token address a reviewer's current `StakeBalance` is denominated in,
+    /// so it can be transferred back correctly on `claim_stake`.
+    StakeToken(Address),
+    /// The ledger timestamp at which the reviewer first staked (i.e. submitted
+    /// their first review). Used by `claim_stake` to enforce `STAKE_LOCKUP_SECONDS`.
+    /// Reset to the current timestamp whenever additional stake is added so that
+    /// all stake (including incremental deposits) must age past the lockup.
+    StakeLockupTs(Address),
     ReviewAppeal(Address, Address, u64),
     DisputeContract,
     Endorsement(Address, String, Address),
     SkillEndorsers(Address, String),
     StakeTiers,
+    /// Admin-configurable minimum stake weight. Reviews with stake_weight below
+    /// this value are rejected even when the economic min_stake allows zero stakes.
+    MinStakeWeight,
+    /// Marks a user as banned by an admin. Banned users are excluded from
+    /// leaderboard queries.
+    BannedUser(Address),
+    /// Tracks (window_start_ledger, count) of reviews received by this
+    /// reviewee within the current rate-limit window (issue #1117).
+    RevieweeReviewWindow(Address),
 }
 
 fn require_not_paused(env: &Env) -> Result<(), ReputationError> {
@@ -291,16 +427,97 @@ fn is_signer(env: &Env, address: &Address) -> bool {
     }
 }
 
+/// Effective upper bound for the reputation decay rate: the super-admin
+/// configured value if present, otherwise the `MAX_DECAY_RATE` default.
+fn effective_max_decay_rate(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaxDecayRate)
+        .unwrap_or(MAX_DECAY_RATE)
+}
+
 const MIN_REVIEW_STAKE_DEFAULT: i128 = 10_000_000; // 1.0 unit (7 decimals)
 const RATE_LIMIT_LEDGERS_DEFAULT: u32 = 120; // ~10 minutes
+/// Hard floor on the stake_weight used as reputation vote weight.
+/// Prevents zero-weight reviews from gaining weight=1 via the fallback path.
+pub const MIN_STAKE_WEIGHT: u64 = 1;
+
+/// Minimum lockup duration in seconds before staked tokens can be reclaimed.
+/// 7 days (604_800 seconds). This ensures that reputation weight established by
+/// a stake cannot be flash-loaned: the economic cost must be borne for at least
+/// this period, making governance manipulation via rapid stake/unstake
+/// economically meaningful rather than free (issue #exploit).
+pub const STAKE_LOCKUP_SECONDS: u64 = 7 * 24 * 60 * 60; // 604_800
+
+/// Per-review cap on the stake weight credited toward `total_score` and
+/// `total_weight`. Any stake_weight above this threshold is clamped before it
+/// is multiplied by the star rating and added to the reviewee's reputation.
+/// This prevents a single self-dealt review with an arbitrarily large
+/// `stake_weight` from dominating `total_score` and thereby inflating
+/// governance voting power via `get_gov_weight` (issue #exploit).
+///
+/// Set to 1_000 units at 7 decimals = 10_000_000_000 stroops. Reviewers who
+/// want more governance influence must earn it across multiple distinct
+/// counterparties rather than from a single inflated stake.
+pub const MAX_STAKE_WEIGHT_PER_REVIEW: u64 = 1_000 * 10_000_000; // 10_000_000_000
+
+/// Absolute cap on the `score` value returned by `get_gov_weight`. Defense-in-
+/// depth against any future bypass of the per-review cap. Equals five 5-star
+/// max-weight reviews times the maximum counted reviews (200), so a legitimately
+/// excellent user is never capped in practice.
+pub const MAX_GOV_WEIGHT: u64 = 5 * MAX_STAKE_WEIGHT_PER_REVIEW * 200; // 10_000_000_000_000
+
 const DEFAULT_REFERRAL_BONUS: u64 = 5; // Equivalates to a 5-star review bonus
 /// Weight used when crediting referral bonus to reputation (not min review stake).
 const REFERRAL_BONUS_REPUTATION_WEIGHT: u64 = 1;
-const ONE_YEAR_IN_SECONDS: u64 = 31_536_000;
+const ONE_YEAR_IN_SECONDS: u64 = 31_536_000;/// Default upper bound for the annual reputation `decay_rate` (percent per year).
+/// 20% keeps decay meaningful without destroying accumulated reputation in a
+/// single period. The super-admin can raise this via `set_max_decay_rate` up to
+/// `MAX_DECAY_RATE_HARD_CEILING` (issue #783).
+const MAX_DECAY_RATE: u32 = 20;
+/// Absolute ceiling the configurable maximum decay rate can never exceed.
+const MAX_DECAY_RATE_HARD_CEILING: u32 = 50;
 
-const MIN_TTL_THRESHOLD: u32 = 1_000;
-const MIN_TTL_EXTEND_TO: u32 = 10_000;
+const MIN_TTL_THRESHOLD: u32 = 50_000_000;
+const MIN_TTL_EXTEND_TO: u32 = 50_000_000;
 const APPEAL_GRACE_WINDOW_SECONDS: u64 = 72 * 60 * 60;
+// Bounds how many endorsers `get_skill_score` sums over. Without a cap, the
+// `SkillEndorsers` list (and therefore the loop's cost and the returned
+// score) could grow without limit (issue #987).
+const MAX_ENDORSERS_COUNTED: u32 = 30;
+// Bounds how many Review/ReferralBonusRecord entries `get_decayed_totals`
+// scores per user, following the same pattern as `MAX_ENDORSERS_COUNTED`.
+// Without a cap, a griefer could spam low-cost completed jobs/reviews against
+// a single target to grow their `Reviews(user)` vector without bound, making
+// every read of that user's score (get_reputation, get_gov_weight, and
+// dispute's is_eligible_voter) exceed the Soroban instruction budget and
+// silently lock them out of governance/dispute-voting eligibility (issue
+// #1117). Only the most recent entries are scored, since decay already makes
+// older entries contribute the least to the total.
+const MAX_REVIEWS_COUNTED: u32 = 200;
+/// Complementary mitigation for issue #1117: caps how many reviews a single
+/// reviewee can accumulate within one rate-limit window (the same window
+/// used by the existing per-reviewer cooldown), slowing how fast a griefer
+/// can grow a target's Reviews vector in the first place.
+const MAX_REVIEWS_PER_REVIEWEE_WINDOW: u32 = 20;
+// Bounds how many stake tiers `set_stake_tiers` accepts. `get_stake_multiplier`
+// iterates the full tier list on every rating computation (hot path for
+// `get_average_rating`, `get_score_badge`, and leaderboard updates), so an unbounded
+// list would make those calls progressively more expensive (issue #1177).
+const MAX_STAKE_TIERS: u32 = 10;
+
+/// Maximum number of users returned in a single leaderboard page query.
+/// Prevents unbounded iteration costs and keeps response sizes manageable.
+const LEADERBOARD_PAGE_SIZE_CAP: u32 = 50;
+
+/// Reputation score change applied when a user wins a dispute.
+const DISPUTE_OUTCOME_WON_SCORE: i64 = 50;
+
+/// Reputation score change applied when a user loses a dispute.
+const DISPUTE_OUTCOME_LOST_SCORE: i64 = -100;
+
+/// Reputation score change applied when a user is found to have filed a dispute in bad faith.
+const DISPUTE_OUTCOME_MALICIOUS_FILING_SCORE: i64 = -250;
 
 fn bump_reputation_ttl(env: &Env, user: &Address) {
     env.storage().persistent().extend_ttl(
@@ -342,6 +559,19 @@ fn bump_review_appeal_ttl(env: &Env, reviewer: &Address, reviewee: &Address, job
     );
 }
 
+fn bump_endorsement_ttl(env: &Env, target: &Address, skill: &String, endorser: &Address) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::Endorsement(target.clone(), skill.clone(), endorser.clone()),
+        MIN_TTL_THRESHOLD,
+        MIN_TTL_EXTEND_TO,
+    );
+    env.storage().persistent().extend_ttl(
+        &DataKey::SkillEndorsers(target.clone(), skill.clone()),
+        MIN_TTL_THRESHOLD,
+        MIN_TTL_EXTEND_TO,
+    );
+}
+
 fn bump_instance_ttl(env: &Env) {
     env.storage()
         .instance()
@@ -349,41 +579,44 @@ fn bump_instance_ttl(env: &Env) {
 }
 
 pub fn apply_lazy_decay(env: &Env, rep: &mut UserReputation) {
+    env.storage()
+        .instance()
+        .extend_ttl(MIN_TTL_THRESHOLD, MIN_TTL_EXTEND_TO);
     let decay_rate: u32 = env
         .storage()
         .instance()
         .get(&DataKey::DecayRate)
         .unwrap_or(0);
+
+    let current_ts = env.ledger().timestamp() as u32;
     if decay_rate == 0 || decay_rate >= 100 {
-        rep.last_updated_ledger = env.ledger().sequence();
+        rep.last_updated_ts = current_ts;
         return;
     }
 
-    let current_ledger = env.ledger().sequence();
-    if current_ledger <= rep.last_updated_ledger {
+    let last_ts = rep.last_updated_ts as u64;
+    let now_ts = current_ts as u64;
+    if now_ts <= last_ts {
         return;
     }
 
-    let elapsed = current_ledger - rep.last_updated_ledger;
-    let periods = elapsed / 518400; // e.g. 30 days
+    let elapsed_seconds = now_ts - last_ts;
+    // Linear annual decay: decay_rate% per year applied proportionally to elapsed time.
+    // retained_pct = max(0, 100 - decay_rate * elapsed_years)
+    // Use integer arithmetic: elapsed_years * 100 = elapsed_seconds * 100 / ONE_YEAR_IN_SECONDS
+    let decay_amount = (decay_rate as u64) * elapsed_seconds / ONE_YEAR_IN_SECONDS;
+    let retained_pct = 100_u64.saturating_sub(decay_amount);
 
-    if periods > 0 {
-        let retained = 100_u64.saturating_sub(decay_rate as u64);
-        let mut score = rep.total_score;
-        let mut weight = rep.total_weight;
+    rep.total_score  = (rep.total_score  * retained_pct) / 100;
+    rep.total_weight = (rep.total_weight * retained_pct) / 100;
+    rep.last_updated_ts = current_ts;
+}
 
-        for _ in 0..periods {
-            score = (score * retained) / 100;
-            weight = (weight * retained) / 100;
-            if score == 0 && weight == 0 {
-                break;
-            }
-        }
-
-        rep.total_score = score;
-        rep.total_weight = weight;
-        rep.last_updated_ledger += periods * 518400;
-    }
+/// Applies a 0-100 decay `factor` (percent) to `value` as `value * factor / 100`
+/// using a u128 intermediate so large `value`s (already saturated to u64::MAX)
+/// don't overflow before the division brings the result back under u64::MAX.
+fn scale_by_factor_pct(value: u64, factor: u64) -> u64 {
+    ((value as u128) * (factor as u128) / 100) as u64
 }
 
 fn get_decay_factor(decay_rate: u32, current_time: u64, recorded_at: u64) -> u64 {
@@ -457,6 +690,19 @@ impl ReputationContract {
             return Err(ReputationError::BelowMinStake);
         }
 
+        // 1b. Minimum Stake Weight Check — enforces a hard floor on the vote weight
+        // regardless of how the economic min_stake is configured. A zero-stake review
+        // would otherwise use weight=1 via the fallback path, letting stake-free
+        // reviewers influence the leaderboard without any economic commitment.
+        let min_stake_weight: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinStakeWeight)
+            .unwrap_or(MIN_STAKE_WEIGHT);
+        if stake_weight < min_stake_weight as i128 {
+            return Err(ReputationError::StakeTooLow);
+        }
+
         // 2. Rate Limit Check
         let rate_limit = env
             .storage()
@@ -482,6 +728,37 @@ impl ReputationContract {
             // Extend TTL for rate limit data
             env.storage().persistent().extend_ttl(
                 &last_ledger_key,
+                MIN_TTL_THRESHOLD,
+                MIN_TTL_EXTEND_TO,
+            );
+
+            // 2b. Per-reviewee rate limit (issue #1117): bounds how many reviews a
+            // single reviewee can accumulate within one rate-limit window, so a
+            // griefer cannot rapidly grow a target's Reviews vector even though
+            // each individual review comes from a different reviewer/job.
+            let window_key = DataKey::RevieweeReviewWindow(reviewee.clone());
+            let (window_start, count): (u32, u32) = env
+                .storage()
+                .persistent()
+                .get(&window_key)
+                .unwrap_or((current_ledger, 0));
+
+            let (window_start, count) = if current_ledger >= window_start.saturating_add(rate_limit)
+            {
+                (current_ledger, 0)
+            } else {
+                (window_start, count)
+            };
+
+            if count >= MAX_REVIEWS_PER_REVIEWEE_WINDOW {
+                return Err(ReputationError::RateLimitExceeded);
+            }
+
+            env.storage()
+                .persistent()
+                .set(&window_key, &(window_start, count + 1));
+            env.storage().persistent().extend_ttl(
+                &window_key,
                 MIN_TTL_THRESHOLD,
                 MIN_TTL_EXTEND_TO,
             );
@@ -526,11 +803,37 @@ impl ReputationContract {
             .persistent()
             .extend_ttl(&balance_key, MIN_TTL_THRESHOLD, MIN_TTL_EXTEND_TO);
 
-        let weight = if stake_weight > 0 {
-            stake_weight as u64
+        // Record which token this stake is denominated in so claim_stake can
+        // transfer the correct asset back.
+        let stake_token_key = DataKey::StakeToken(reviewer.clone());
+        env.storage().persistent().set(&stake_token_key, &job.token);
+        env.storage()
+            .persistent()
+            .extend_ttl(&stake_token_key, MIN_TTL_THRESHOLD, MIN_TTL_EXTEND_TO);
+
+        // Record (or refresh) the lockup start timestamp. We always write the
+        // current timestamp so that incremental stakes cannot use an old anchor
+        // to escape the lockup early. The full lockup window restarts from the
+        // latest deposit, ensuring all accumulated stake is bound for
+        // STAKE_LOCKUP_SECONDS from the most recent review (issue #exploit).
+        let lockup_key = DataKey::StakeLockupTs(reviewer.clone());
+        let current_ts = env.ledger().timestamp();
+        env.storage().persistent().set(&lockup_key, &current_ts);
+        env.storage()
+            .persistent()
+            .extend_ttl(&lockup_key, MIN_TTL_THRESHOLD, MIN_TTL_EXTEND_TO);
+
+        // Saturate stake_weight to u64::MAX instead of truncating to prevent
+        // large i128 stakes from wrapping to arbitrary values (issue #982).
+        // Then apply the per-review cap (MAX_STAKE_WEIGHT_PER_REVIEW) so that a
+        // single self-dealt review with an arbitrarily large stake_weight cannot
+        // dominate total_score and mint free governance power (issue #exploit).
+        let raw_weight = if stake_weight > 0 {
+            i128::min(stake_weight, u64::MAX as i128) as u64
         } else {
             1u64
         };
+        let weight = raw_weight.min(MAX_STAKE_WEIGHT_PER_REVIEW);
 
         // Capture the old tier before mutating reputation so the tier_up event
         // can carry both the previous and new tier values.
@@ -549,15 +852,17 @@ impl ReputationContract {
                     total_score: 0,
                     total_weight: 0,
                     review_count: 0,
-                    last_updated_ledger: env.ledger().sequence(),
+                    last_updated_ts: env.ledger().timestamp() as u32,
                 });
 
         apply_lazy_decay(&env, &mut reputation);
 
-        reputation.total_score += (rating as u64) * weight;
-        reputation.total_weight += weight;
+        reputation.total_score = reputation
+            .total_score
+            .saturating_add((rating as u64).saturating_mul(weight));
+        reputation.total_weight = reputation.total_weight.saturating_add(weight);
         reputation.review_count += 1;
-        reputation.last_updated_ledger = env.ledger().sequence();
+        reputation.last_updated_ts = env.ledger().timestamp() as u32;
 
         env.storage().persistent().set(&rep_key, &reputation);
         bump_reputation_ttl(&env, &reviewee);
@@ -794,14 +1099,14 @@ impl ReputationContract {
                     total_score: 0,
                     total_weight: 0,
                     review_count: 0,
-                    last_updated_ledger: env.ledger().sequence(),
+                    last_updated_ts: env.ledger().timestamp() as u32,
                 });
 
             apply_lazy_decay(env, &mut reputation);
 
             reputation.total_score += earned_score;
             reputation.total_weight += weight;
-            reputation.last_updated_ledger = env.ledger().sequence();
+            reputation.last_updated_ts = env.ledger().timestamp() as u32;
 
             env.storage().persistent().set(&rep_key, &reputation);
             bump_reputation_ttl(env, &referrer);
@@ -828,17 +1133,28 @@ impl ReputationContract {
                 (referrer.clone(), earned_score, user.clone()),
             );
 
+            // The descriptive `referral_reward` event must carry the same payload as
+            // the legacy `ref_rwrd` event above. It previously omitted `user` (the
+            // referee whose activity triggered the payout), so an indexer that
+            // migrated from the legacy topic could no longer tell *which* referred
+            // account earned the referrer their bonus (issue #1433). Keep the two
+            // tuples field-for-field identical.
             env.events().publish(
                 (symbol_short!("reput"), Symbol::new(env, "referral_reward")),
-                (referrer, earned_score),
+                (referrer, earned_score, user),
             );
         }
     }
 
     /// Set configuration for the referral bonus (multi-sig only)
-    pub fn set_referral_bonus(env: Env, bonus: u64) -> Result<(), ReputationError> {
-        if env.current_contract_address() != env.current_contract_address() {
-            return Err(ReputationError::Unauthorized);
+    pub fn set_referral_bonus(
+        env: Env,
+        signer: Address,
+        bonus: u64,
+    ) -> Result<(), ReputationError> {
+        signer.require_auth();
+        if !is_signer(&env, &signer) {
+            return Err(ReputationError::NotAdmin);
         }
         env.storage()
             .instance()
@@ -847,8 +1163,152 @@ impl ReputationContract {
         Ok(())
     }
 
+    /// Record a referral bonus for `user` with an explicit `timestamp`.
+    ///
+    /// Restricted to registered multi-sig signers — used for migrations and
+    /// manual corrections that need to backfill a bonus with its original date.
+    ///
+    /// Security (issue #781): the `timestamp` is validated to be at or before the
+    /// current ledger time. A future-dated bonus would make `get_decay_factor`
+    /// compute `elapsed_seconds = 0` forever, permanently exempting the bonus
+    /// from time decay and inflating the user's score regardless of how much
+    /// time actually passes. Past and current timestamps are accepted so the
+    /// bonus decays from its true origin date.
+    pub fn add_referral_bonus(
+        env: Env,
+        signer: Address,
+        user: Address,
+        amount: u64,
+        weight: u64,
+        timestamp: u64,
+    ) -> Result<(), ReputationError> {
+        signer.require_auth();
+        if !is_signer(&env, &signer) {
+            return Err(ReputationError::NotAdmin);
+        }
+        require_not_paused(&env)?;
+
+        // Reject future timestamps that would bypass decay (see doc comment).
+        if timestamp > env.ledger().timestamp() {
+            return Err(ReputationError::InvalidTimestamp);
+        }
+
+        let bonuses_key = DataKey::ReferralBonusList(user.clone());
+        let mut bonuses: Vec<ReferralBonusRecord> = env
+            .storage()
+            .persistent()
+            .get(&bonuses_key)
+            .unwrap_or(Vec::new(&env));
+        bonuses.push_back(ReferralBonusRecord {
+            amount,
+            weight,
+            timestamp,
+        });
+        env.storage().persistent().set(&bonuses_key, &bonuses);
+        env.storage().persistent().extend_ttl(
+            &bonuses_key,
+            MIN_TTL_THRESHOLD,
+            MIN_TTL_EXTEND_TO,
+        );
+
+        // Mirror `process_referral_bonus`: keep the legacy reputation accumulator
+        // present so `get_reputation` resolves the user. The decayed totals are
+        // always recomputed from the bonus list, so this stays consistent.
+        let rep_key = DataKey::Reputation(user.clone());
+        let mut reputation: UserReputation = env
+            .storage()
+            .persistent()
+            .get(&rep_key)
+            .unwrap_or(UserReputation {
+                user: user.clone(),
+                total_score: 0,
+                total_weight: 0,
+                review_count: 0,
+                last_updated_ts: env.ledger().timestamp() as u32,
+            });
+        apply_lazy_decay(&env, &mut reputation);
+        reputation.total_score = reputation.total_score.saturating_add(amount);
+        reputation.total_weight = reputation.total_weight.saturating_add(weight);
+        reputation.last_updated_ts = env.ledger().timestamp() as u32;
+        env.storage().persistent().set(&rep_key, &reputation);
+        bump_reputation_ttl(&env, &user);
+
+        // Keep the leaderboard consistent with the user's new decayed totals.
+        Self::update_leaderboard(&env, &user);
+
+        env.events().publish(
+            (symbol_short!("reput"), symbol_short!("ref_add")),
+            (user, amount, timestamp),
+        );
+
+        Ok(())
+    }
+
+    /// Update the annual reputation `decay_rate` (percent per year).
+    ///
+    /// Restricted to registered multi-sig signers.
+    ///
+    /// Security (issue #783): the rate is bounded by the configurable maximum
+    /// (`effective_max_decay_rate`, default `MAX_DECAY_RATE`). Without an upper
+    /// bound, a rate such as 99 would erase ~99% of every score within a year,
+    /// emptying the leaderboard and rendering reputation meaningless. Values
+    /// above the maximum are rejected with `DecayRateTooHigh`.
+    pub fn update_decay_rate(
+        env: Env,
+        signer: Address,
+        decay_rate: u32,
+    ) -> Result<(), ReputationError> {
+        signer.require_auth();
+        if !is_signer(&env, &signer) {
+            return Err(ReputationError::NotAdmin);
+        }
+        if decay_rate > effective_max_decay_rate(&env) {
+            return Err(ReputationError::DecayRateTooHigh);
+        }
+        env.storage().instance().set(&DataKey::DecayRate, &decay_rate);
+        bump_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("reput"), symbol_short!("decay_set")),
+            decay_rate,
+        );
+
+        Ok(())
+    }
+
+    /// Set the configurable maximum allowed `decay_rate` (super-admin only).
+    ///
+    /// Restricted to registered multi-sig signers and itself capped at
+    /// `MAX_DECAY_RATE_HARD_CEILING` (50%) so that even a compromised admin
+    /// cannot raise the ceiling high enough to destroy all reputation (issue
+    /// #783). Requests above the hard ceiling are rejected with
+    /// `DecayRateTooHigh`.
+    pub fn set_max_decay_rate(
+        env: Env,
+        signer: Address,
+        rate: u32,
+    ) -> Result<(), ReputationError> {
+        signer.require_auth();
+        if !is_signer(&env, &signer) {
+            return Err(ReputationError::NotAdmin);
+        }
+        if rate > MAX_DECAY_RATE_HARD_CEILING {
+            return Err(ReputationError::DecayRateTooHigh);
+        }
+        env.storage().instance().set(&DataKey::MaxDecayRate, &rate);
+        bump_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("reput"), symbol_short!("max_decay")),
+            rate,
+        );
+
+        Ok(())
+    }
+
     /// Get the reputation data for a user, applying time decay to totals.
     pub fn get_reputation(env: Env, user: Address) -> Result<UserReputation, ReputationError> {
+        bump_instance_ttl(&env);
         let rep_key = DataKey::Reputation(user.clone());
         if !env.storage().persistent().has(&rep_key) {
             return Err(ReputationError::UserNotFound);
@@ -863,8 +1323,52 @@ impl ReputationContract {
             total_score,
             total_weight,
             review_count,
-            last_updated_ledger: env.ledger().sequence(),
+            last_updated_ts: env.ledger().timestamp() as u32,
         })
+    }
+
+    /// Governance weight snapshot helper (issue #899).
+    ///
+    /// Returns `(score, last_change_ts)` where:
+    /// - `score` is the user's current decayed, stake-weighted reputation total
+    ///   (`total_score` from [`get_decayed_totals`]) — used as raw voting weight
+    ///   by the reputation-weighted governance path in the escrow contract.
+    /// - `last_change_ts` is the ledger timestamp of the user's most recent
+    ///   *score-changing* event (review, slash, dispute outcome, referral bonus,
+    ///   appeal resolution). It is read from the stored [`UserReputation`], whose
+    ///   `last_updated_ts` is bumped by every such mutation and is **not**
+    ///   moved by pure reads.
+    ///
+    /// # Snapshot safety
+    ///
+    /// Governance compares `last_change_ts` against a proposal's snapshot
+    /// timestamp and only accepts a vote when `last_change_ts <= snapshot_ts`.
+    /// This makes reputation acquired *after* a proposal opens ineligible to vote
+    /// on it, defeating the classic "pump reputation to swing an in-flight vote"
+    /// attack. Because the returned score is the decayed value read at call time
+    /// and decay is monotonically non-increasing, the weight can only be *lower*
+    /// than it was at snapshot time — never inflated — so the check is safe.
+    ///
+    /// Unknown users return `(0, 0)`: zero weight, and a `last_change_ts` of `0`
+    /// that is `<=` any snapshot (they simply have no weight to cast).
+    pub fn get_gov_weight(env: Env, user: Address) -> (u64, u64) {
+        bump_instance_ttl(&env);
+        let stored: Option<UserReputation> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Reputation(user.clone()));
+        let last_change_ts = match stored {
+            Some(rep) => rep.last_updated_ts as u64,
+            // No reputation record: no weight, and a snapshot-safe timestamp of 0.
+            None => return (0, 0),
+        };
+        let (total_score, _total_weight, _review_count) = Self::get_decayed_totals(&env, user);
+        // Cap the returned score at MAX_GOV_WEIGHT so that even if per-review
+        // capping is somehow bypassed in a future code path, a single user's
+        // raw total_score cannot translate into unbounded governance voting power
+        // (issue #exploit, defense-in-depth).
+        let capped_score = total_score.min(MAX_GOV_WEIGHT);
+        (capped_score, last_change_ts)
     }
 
     /// Get reputation together with the registered referrer (if any).
@@ -984,13 +1488,13 @@ impl ReputationContract {
                     total_score: 0,
                     total_weight: 0,
                     review_count: 0,
-                    last_updated_ledger: env.ledger().sequence(),
+                    last_updated_ts: env.ledger().timestamp() as u32,
                 });
 
         apply_lazy_decay(&env, &mut reputation);
 
         reputation.total_score = reputation.total_score.saturating_sub(amount);
-        reputation.last_updated_ledger = env.ledger().sequence();
+        reputation.last_updated_ts = env.ledger().timestamp() as u32;
         env.storage().persistent().set(&rep_key, &reputation);
         bump_reputation_ttl(&env, &user);
 
@@ -1025,9 +1529,9 @@ impl ReputationContract {
         dispute_contract.require_auth();
 
         let score_change: i64 = match outcome {
-            DisputeOutcome::Won => 50,
-            DisputeOutcome::Lost => -100,
-            DisputeOutcome::MaliciousFiling => -250,
+            DisputeOutcome::Won => DISPUTE_OUTCOME_WON_SCORE,
+            DisputeOutcome::Lost => DISPUTE_OUTCOME_LOST_SCORE,
+            DisputeOutcome::MaliciousFiling => DISPUTE_OUTCOME_MALICIOUS_FILING_SCORE,
         };
 
         let rep_key = DataKey::Reputation(user.clone());
@@ -1040,8 +1544,10 @@ impl ReputationContract {
                 total_score: 0,
                 total_weight: 0,
                 review_count: 0,
-                last_updated_ledger: 0,
+                last_updated_ts: env.ledger().timestamp() as u32,
             });
+
+        apply_lazy_decay(&env, &mut reputation);
 
         if score_change > 0 {
             reputation.total_score = reputation.total_score.saturating_add(score_change as u64);
@@ -1049,6 +1555,7 @@ impl ReputationContract {
             reputation.total_score = reputation.total_score.saturating_sub((-score_change) as u64);
         }
 
+        reputation.last_updated_ts = env.ledger().timestamp() as u32;
         env.storage().persistent().set(&rep_key, &reputation);
         bump_reputation_ttl(&env, &user);
 
@@ -1077,6 +1584,85 @@ impl ReputationContract {
             .instance()
             .get(&DataKey::RateLimit)
             .unwrap_or(RATE_LIMIT_LEDGERS_DEFAULT)
+    }
+
+    /// Get the current minimum stake weight threshold.
+    pub fn get_min_stake_weight(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinStakeWeight)
+            .unwrap_or(MIN_STAKE_WEIGHT)
+    }
+
+    /// Get the current decay rate configuration (percentage per year).
+    /// Returns 0 if no decay rate has been configured.
+    pub fn get_decay_rate(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::DecayRate)
+            .unwrap_or(0)
+    }
+
+    /// Set the minimum stake weight threshold (admin/signer only).
+    /// Reviews submitted with stake_weight below this value are rejected with StakeTooLow.
+    pub fn set_min_stake_weight(
+        env: Env,
+        admin: Address,
+        weight: u64,
+    ) -> Result<(), ReputationError> {
+        admin.require_auth();
+        if !is_signer(&env, &admin) {
+            return Err(ReputationError::NotAdmin);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MinStakeWeight, &weight);
+        bump_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("reput"), Symbol::new(&env, "min_wt_set")),
+            (admin, weight),
+        );
+
+        Ok(())
+    }
+
+    /// Ban a user, excluding them from all leaderboard queries (admin/signer only).
+    pub fn ban_user(env: Env, admin: Address, user: Address) -> Result<(), ReputationError> {
+        admin.require_auth();
+        if !is_signer(&env, &admin) {
+            return Err(ReputationError::NotAdmin);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::BannedUser(user.clone()), &true);
+        bump_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("reput"), Symbol::new(&env, "banned")),
+            (user, admin),
+        );
+
+        Ok(())
+    }
+
+    /// Unban a user, restoring their visibility on the leaderboard (admin/signer only).
+    pub fn unban_user(env: Env, admin: Address, user: Address) -> Result<(), ReputationError> {
+        admin.require_auth();
+        if !is_signer(&env, &admin) {
+            return Err(ReputationError::NotAdmin);
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::BannedUser(user.clone()));
+        bump_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("reput"), Symbol::new(&env, "unbanned")),
+            (user, admin),
+        );
+
+        Ok(())
     }
 
     pub fn propose_admin_action(
@@ -1142,11 +1728,13 @@ impl ReputationContract {
             return Err(ReputationError::NotAdmin);
         }
 
+        // Lookup failure, not an authorization failure: the caller has already
+        // cleared the `is_signer` check above (issue #1434).
         let mut proposal: MultiSigProposal = env
             .storage()
             .instance()
             .get(&DataKey::MultiSigProposal(proposal_id))
-            .ok_or(ReputationError::NotAdmin)?;
+            .ok_or(ReputationError::ProposalNotFound)?;
 
         if proposal.executed {
             return Err(ReputationError::Unauthorized);
@@ -1179,11 +1767,14 @@ impl ReputationContract {
     }
 
     fn execute_proposal(env: &Env, proposal_id: u64) -> Result<(), ReputationError> {
+        // Lookup failure, not an authorization failure: this is an internal
+        // helper reached only after the caller has cleared a signer check
+        // (issue #1434).
         let mut proposal: MultiSigProposal = env
             .storage()
             .instance()
             .get(&DataKey::MultiSigProposal(proposal_id))
-            .ok_or(ReputationError::NotAdmin)?;
+            .ok_or(ReputationError::ProposalNotFound)?;
 
         if proposal.executed {
             return Err(ReputationError::Unauthorized);
@@ -1251,6 +1842,8 @@ impl ReputationContract {
                     env.storage()
                         .instance()
                         .set(&DataKey::MultiSigSigners, &signers);
+                } else {
+                    return Err(ReputationError::NotAdmin);
                 }
             }
             AdminAction::ChangeThreshold(new_threshold) => {
@@ -1282,8 +1875,11 @@ impl ReputationContract {
                 }
             }
             AdminAction::SetDecayRate(rate) => {
-                if rate > 100 {
-                    return Err(ReputationError::InvalidDecayRate);
+                // Enforce the same upper bound as `update_decay_rate` so the
+                // multi-sig governance path cannot set a destructive decay rate
+                // (issue #783).
+                if rate > effective_max_decay_rate(env) {
+                    return Err(ReputationError::DecayRateTooHigh);
                 }
                 env.storage().instance().set(&DataKey::DecayRate, &rate);
             }
@@ -1298,13 +1894,13 @@ impl ReputationContract {
                         total_score: 0,
                         total_weight: 0,
                         review_count: 0,
-                        last_updated_ledger: env.ledger().sequence(),
+                        last_updated_ts: env.ledger().timestamp() as u32,
                     });
 
                 apply_lazy_decay(&env, &mut reputation);
 
                 reputation.total_score = reputation.total_score.saturating_sub(amount);
-                reputation.last_updated_ledger = env.ledger().sequence();
+                reputation.last_updated_ts = env.ledger().timestamp() as u32;
                 env.storage().persistent().set(&rep_key, &reputation);
                 bump_reputation_ttl(env, &loser);
 
@@ -1314,6 +1910,9 @@ impl ReputationContract {
                 );
             }
             AdminAction::SetStakeTiers(tiers) => {
+                if tiers.len() > MAX_STAKE_TIERS {
+                    return Err(ReputationError::TooManyStakeTiers);
+                }
                 env.storage().instance().set(&DataKey::StakeTiers, &tiers);
             }
         }
@@ -1360,21 +1959,77 @@ impl ReputationContract {
     }
 
     fn get_decayed_totals(env: &Env, user: Address) -> (u64, u64, u32) {
-        let rep_key = DataKey::Reputation(user.clone());
-        let mut rep: UserReputation =
-            env.storage()
-                .persistent()
-                .get(&rep_key)
-                .unwrap_or(UserReputation {
-                    user: user.clone(),
-                    total_score: 0,
-                    total_weight: 0,
-                    review_count: 0,
-                    last_updated_ledger: env.ledger().sequence(),
-                });
+        env.storage()
+            .instance()
+            .extend_ttl(MIN_TTL_THRESHOLD, MIN_TTL_EXTEND_TO);
 
-        apply_lazy_decay(env, &mut rep);
-        (rep.total_score, rep.total_weight, rep.review_count)
+        let decay_rate: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DecayRate)
+            .unwrap_or(0);
+        let current_ts = env.ledger().timestamp();
+
+        let reviews_key = DataKey::Reviews(user.clone());
+        let reviews: Vec<Review> = env
+            .storage()
+            .persistent()
+            .get(&reviews_key)
+            .unwrap_or(Vec::new(env));
+
+        // Extend TTL on read so that a frequently-read entry never silently expires.
+        if !reviews.is_empty() {
+            bump_reviews_ttl(env, &user);
+        }
+
+        let review_count = reviews.len() as u32;
+        let mut total_score = 0u64;
+        let mut total_weight = 0u64;
+
+        // Score only the most recent MAX_REVIEWS_COUNTED reviews so this
+        // function's cost stays bounded regardless of how many reviews `user`
+        // has ever received (issue #1117). Reviews are appended in order, so
+        // the tail of the vector is the most recent.
+        let start = review_count.saturating_sub(MAX_REVIEWS_COUNTED);
+        for idx in start..review_count {
+            if let Some(review) = reviews.get(idx) {
+                let factor = get_decay_factor(decay_rate, current_ts, review.timestamp);
+                // Saturate stake_weight to u64::MAX to prevent truncation (issue #982).
+                // Then cap at MAX_STAKE_WEIGHT_PER_REVIEW so that historical reviews
+                // submitted before the per-review cap was enforced in submit_review
+                // cannot still contribute unbounded weight on the read path (issue #exploit).
+                let clamped_weight = i128::min(review.stake_weight, u64::MAX as i128) as u64;
+                let capped_weight = clamped_weight.min(MAX_STAKE_WEIGHT_PER_REVIEW);
+                let decayed_weight = scale_by_factor_pct(capped_weight, factor);
+                total_score = total_score
+                    .saturating_add((review.rating as u64).saturating_mul(decayed_weight));
+                total_weight = total_weight.saturating_add(decayed_weight);
+            }
+        }
+
+        // Include referral bonuses (stored as ReferralBonusRecord with individual timestamps),
+        // similarly bounded to the most recent MAX_REVIEWS_COUNTED entries.
+        let bonuses_key = DataKey::ReferralBonusList(user.clone());
+        if let Some(bonuses) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<ReferralBonusRecord>>(&bonuses_key)
+        {
+            let bonus_count = bonuses.len() as u32;
+            let start = bonus_count.saturating_sub(MAX_REVIEWS_COUNTED);
+            for idx in start..bonus_count {
+                if let Some(bonus) = bonuses.get(idx) {
+                    let factor = get_decay_factor(decay_rate, current_ts, bonus.timestamp);
+                    // bonus.amount = bonus_rating * bonus.weight; apply same decay factor.
+                    total_score =
+                        total_score.saturating_add(scale_by_factor_pct(bonus.amount, factor));
+                    total_weight =
+                        total_weight.saturating_add(scale_by_factor_pct(bonus.weight, factor));
+                }
+            }
+        }
+
+        (total_score, total_weight, review_count)
     }
 
     pub fn endorse(
@@ -1385,6 +2040,10 @@ impl ReputationContract {
     ) -> Result<(), ReputationError> {
         endorser.require_auth();
         require_not_paused(&env)?;
+
+        if endorser == target {
+            return Err(ReputationError::SelfEndorsement);
+        }
 
         let key = DataKey::Endorsement(target.clone(), skill.clone(), endorser.clone());
         if env.storage().persistent().has(&key) {
@@ -1401,10 +2060,20 @@ impl ReputationContract {
             .unwrap_or(Vec::new(&env));
         endorsers.push_back(endorser.clone());
         env.storage().persistent().set(&list_key, &endorsers);
+        bump_endorsement_ttl(&env, &target, &skill, &endorser);
 
         Ok(())
     }
 
+    /// Compute a user's skill score as the sum, over everyone who has
+    /// endorsed them for `skill`, of each endorser's weight — their
+    /// `get_average_rating() / 100`, or `1` if they have no rating yet.
+    ///
+    /// Security (issue #987): `endorse` rejects `endorser == target`, so a
+    /// user cannot inflate this score by endorsing themselves. The number of
+    /// endorsers summed is additionally capped at `MAX_ENDORSERS_COUNTED` so
+    /// that neither this function's cost nor the score it returns can grow
+    /// without bound as a skill accumulates endorsers.
     pub fn get_skill_score(env: Env, user: Address, skill: String) -> u32 {
         let list_key = DataKey::SkillEndorsers(user.clone(), skill.clone());
         let endorsers: Vec<Address> = env
@@ -1414,7 +2083,7 @@ impl ReputationContract {
             .unwrap_or(Vec::new(&env));
 
         let mut score = 0;
-        for endorser in endorsers.iter() {
+        for endorser in endorsers.iter().take(MAX_ENDORSERS_COUNTED as usize) {
             let avg_rating = Self::get_average_rating(env.clone(), endorser.clone()).unwrap_or(0);
             let weight = if avg_rating > 0 { avg_rating / 100 } else { 1 };
             score += weight as u32;
@@ -1432,7 +2101,17 @@ impl ReputationContract {
         if !is_signer(&env, &admin) {
             return Err(ReputationError::NotAdmin);
         }
+        if tiers.len() > MAX_STAKE_TIERS {
+            return Err(ReputationError::TooManyStakeTiers);
+        }
         env.storage().instance().set(&DataKey::StakeTiers, &tiers);
+        bump_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("reput"), Symbol::new(&env, "tiers_set")),
+            (admin, tiers.clone()),
+        );
+
         Ok(())
     }
 
@@ -1455,6 +2134,15 @@ impl ReputationContract {
         multiplier
     }
 
+    /// Returns the raw staked token balance currently held for a reviewer.
+    /// Returns 0 if the reviewer has no active stake.
+    pub fn get_stake_balance(env: Env, user: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StakeBalance(user))
+            .unwrap_or(0)
+    }
+
     pub fn get_average_rating(env: Env, user: Address) -> Result<u64, ReputationError> {
         let multiplier = Self::get_stake_multiplier(env.clone(), user.clone());
 
@@ -1464,8 +2152,8 @@ impl ReputationContract {
             return Ok(0); // If completely decayed, acts as no rep
         }
 
-        let base_score = (total_score * 100) / total_weight;
-        let weighted = (base_score * (multiplier as u64)) / 100;
+        let base_score = ((total_score as u128) * 100 / (total_weight as u128)) as u64;
+        let weighted = scale_by_factor_pct(base_score, multiplier as u64);
         Ok(weighted.min(10_000))
     }
 
@@ -1499,7 +2187,15 @@ impl ReputationContract {
         }
     }
 
-    /// Get the reputation tier for a user based on their average rating.
+    /// Get the **rating tier** for a user — their standing on the *quality* ladder,
+    /// thresholded on `average_rating` (Bronze ≥ 100, Silver ≥ 300, Gold ≥ 500,
+    /// Platinum ≥ 700 on the 0–10,000 scale).
+    ///
+    /// Because `average_rating` is an average, this is independent of how many
+    /// reviews a user has. It is **not** the same measure as
+    /// [`Self::get_score_badge`], which ranks accumulated volume — the two use
+    /// different inputs and thresholds and often disagree. See the module docs
+    /// (issue #1172).
     pub fn get_tier(env: Env, user: Address) -> ReputationTier {
         match Self::get_average_rating(env, user) {
             Ok(avg_rating) => calculate_tier(avg_rating),
@@ -1507,7 +2203,13 @@ impl ReputationContract {
         }
     }
 
-    /// Get all badges awarded to a user.
+    /// Get every **rating tier** the user has ever reached, as permanent
+    /// [`AwardedBadge`] records (`badge_type` is a [`ReputationTier`]).
+    ///
+    /// Unrelated to [`Self::get_score_badge`], and not a live view: these records
+    /// are written by `submit_review` when a tier is first crossed and are never
+    /// removed, so a user can hold a `Gold` awarded badge while their current tier
+    /// and score badge have decayed below it.
     pub fn get_badges(env: Env, user: Address) -> Vec<AwardedBadge> {
         let badges_key = DataKey::Badges(user);
         let badges: Option<Vec<AwardedBadge>> = env.storage().persistent().get(&badges_key);
@@ -1524,26 +2226,37 @@ impl ReputationContract {
         }
     }
 
-    /// Get the current badge for a user based on their score.
-    /// Badges are computed dynamically from score:
-    /// - Bronze: score ≥ 100
-    /// - Silver: score ≥ 500
-    /// - Gold: score ≥ 2000
-    /// Returns None if the user has no reputation or score < 100.
-    pub fn get_badge(env: Env, user: Address) -> Option<Badge> {
+    /// Get the current **score badge** for a user — their standing on the *volume*
+    /// ladder, thresholded on the raw decayed `total_score`:
+    /// - [`ScoreBadge::Rising`]: score ≥ 100
+    /// - [`ScoreBadge::Established`]: score ≥ 500
+    /// - [`ScoreBadge::Elite`]: score ≥ 2000
+    ///
+    /// Returns `None` if the user has no reputation entry or their decayed score is
+    /// below 100.
+    ///
+    /// This is **not** [`Self::get_tier`]. `total_score` is the sum of
+    /// `rating × stake_weight` over all reviews, so this ladder rises with review
+    /// count and staked amount, while the rating tier is an average and does not.
+    /// The two answer different questions and routinely disagree; the ladders have
+    /// different rungs on purpose (there is no Platinum score badge). See the module
+    /// docs (issue #1172).
+    ///
+    /// Renamed from `get_badge`, which remains available as an alias.
+    pub fn get_score_badge(env: Env, user: Address) -> Option<ScoreBadge> {
         let rep_key = DataKey::Reputation(user.clone());
         let reputation: Option<UserReputation> = env.storage().persistent().get(&rep_key);
-        
+
         match reputation {
-            Some(rep) => {
+            Some(_rep) => {
                 bump_reputation_ttl(&env, &user);
-                let score = rep.total_score;
+                let (score, _total_weight, _review_count) = Self::get_decayed_totals(&env, user);
                 if score >= 2000 {
-                    Some(Badge::Gold)
+                    Some(ScoreBadge::Elite)
                 } else if score >= 500 {
-                    Some(Badge::Silver)
+                    Some(ScoreBadge::Established)
                 } else if score >= 100 {
-                    Some(Badge::Bronze)
+                    Some(ScoreBadge::Rising)
                 } else {
                     None
                 }
@@ -1552,8 +2265,23 @@ impl ReputationContract {
         }
     }
 
+    /// Backwards-compatible alias of [`Self::get_score_badge`], kept so existing
+    /// integrations keep working after the issue #1172 rename. Prefer
+    /// `get_score_badge`, whose name states which of the two reputation ladders it
+    /// reports.
+    pub fn get_badge(env: Env, user: Address) -> Option<ScoreBadge> {
+        Self::get_score_badge(env, user)
+    }
+
     /// Claim staked tokens back after a lockup period. Allows reviewers to withdraw
     /// their stakes. Transfers the claimed amount from the contract back to the reviewer.
+    ///
+    /// Enforces a `STAKE_LOCKUP_SECONDS` wait from the timestamp of the last
+    /// `submit_review` that deposited stake. This prevents flash-loan-funded
+    /// governance weight inflation: an attacker who inflates `total_score` via a
+    /// self-dealt high-stake review must leave the capital locked for 7 days
+    /// before recovering it, making the attack economically meaningful rather
+    /// than free-of-cost (issue #exploit).
     pub fn claim_stake(env: Env, reviewer: Address, amount: i128) -> Result<(), ReputationError> {
         reviewer.require_auth();
         require_not_paused(&env)?;
@@ -1565,6 +2293,22 @@ impl ReputationContract {
             return Err(ReputationError::BelowMinStake);
         }
 
+        // Lockup enforcement: reject claims where the stake is younger than
+        // STAKE_LOCKUP_SECONDS. Pre-existing stakes without a recorded timestamp
+        // (StakeLockupTs absent) are treated as if they were staked at time 0,
+        // so they immediately satisfy the lockup and remain claimable — no
+        // backward-compatibility breakage for stakes that predate this check.
+        let lockup_key = DataKey::StakeLockupTs(reviewer.clone());
+        let staked_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&lockup_key)
+            .unwrap_or(0u64);
+        let current_ts = env.ledger().timestamp();
+        if current_ts < staked_at.saturating_add(STAKE_LOCKUP_SECONDS) {
+            return Err(ReputationError::StakeLockupActive);
+        }
+
         // Update balance
         let new_balance = balance - amount;
         if new_balance > 0 {
@@ -1573,9 +2317,23 @@ impl ReputationContract {
             env.storage().persistent().remove(&balance_key);
         }
 
-        // Transfer tokens back to reviewer
-        let token_client = token::Client::new(&env, &env.current_contract_address());
+        // Transfer tokens back to reviewer, using the token the stake was
+        // actually deposited in (not the reputation contract's own address).
+        let stake_token_key = DataKey::StakeToken(reviewer.clone());
+        let stake_token: Address = env
+            .storage()
+            .persistent()
+            .get(&stake_token_key)
+            .ok_or(ReputationError::StakeTokenNotFound)?;
+        let token_client = token::Client::new(&env, &stake_token);
         token_client.transfer(&env.current_contract_address(), &reviewer, &amount);
+
+        if new_balance <= 0 {
+            env.storage().persistent().remove(&stake_token_key);
+            // Remove the lockup timestamp too — no stake remaining means the
+            // next deposit will anchor a fresh lockup window.
+            env.storage().persistent().remove(&lockup_key);
+        }
 
         env.events().publish(
             (symbol_short!("reput"), symbol_short!("claim")),
@@ -1640,33 +2398,65 @@ impl ReputationContract {
         Ok(())
     }
 
-    /// Get the top N users by average rating. Returns a vector of (Address, average_rating)
-    /// tuples sorted by rating (highest first), up to top 50.
-    pub fn get_leaderboard(env: Env) -> Vec<(Address, u64)> {
+    /// Get a paginated list of top users by average rating.
+    pub fn get_leaderboard_page(env: Env, offset: u32, limit: u32) -> Vec<(Address, u64)> {
         let leaderboard_key = DataKey::Leaderboard;
         let leaderboard: Option<Vec<(Address, u64)>> =
             env.storage().instance().get(&leaderboard_key);
 
-        match leaderboard {
-            Some(list) => {
+        let list = match leaderboard {
+            Some(l) => {
                 env.storage()
                     .instance()
                     .extend_ttl(MIN_TTL_THRESHOLD, MIN_TTL_EXTEND_TO);
-                list
+                l
             }
-            None => Vec::new(&env),
+            None => return Vec::new(&env),
+        };
+
+        let mut filtered = Vec::new(&env);
+        for entry in list.iter() {
+            let is_banned: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::BannedUser(entry.0.clone()))
+                .unwrap_or(false);
+            if !is_banned {
+                filtered.push_back(entry);
+            }
         }
+        let list = filtered;
+
+        let total = list.len();
+        if offset >= total {
+            return Vec::new(&env);
+        }
+
+        let actual_limit = if limit > LEADERBOARD_PAGE_SIZE_CAP { LEADERBOARD_PAGE_SIZE_CAP } else { limit };
+        let end = offset.saturating_add(actual_limit);
+        let end = if end > total { total } else { end };
+
+        let mut page = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(list.get(i).unwrap());
+        }
+        page
+    }
+
+    /// Get the top N users by average rating. Returns a vector of (Address, average_rating)
+    /// tuples sorted by rating (highest first), up to top 50.
+    /// Deprecated: use get_leaderboard_page instead.
+    pub fn get_leaderboard(env: Env) -> Vec<(Address, u64)> {
+        Self::get_leaderboard_page(env, 0, LEADERBOARD_PAGE_SIZE_CAP)
     }
 
     /// Internal function to update the leaderboard after a review is submitted.
     /// Maintains a sorted list of top 50 users by average rating.
     fn update_leaderboard(env: &Env, reviewee: &Address) {
-        const TOP_N: u32 = 50;
-
-        let avg_rating = match Self::get_average_rating(env.clone(), reviewee.clone()) {
-            Ok(rating) => rating,
-            Err(_) => return, // Skip if reputation not found
-        };
+        // Compute the user's decayed totals once. These drive both the
+        // zero-score removal check (issue #785) and the average rating used for
+        // ranking, so we read them here instead of paying for two passes.
+        let (new_score, new_weight, _) = Self::get_decayed_totals(env, reviewee.clone());
 
         let leaderboard_key = DataKey::Leaderboard;
         let mut leaderboard: Vec<(Address, u64)> = env
@@ -1685,6 +2475,35 @@ impl ReputationContract {
             idx += 1;
         }
 
+        // Issue #785: once a user's score and weight have fully decayed to zero,
+        // their entry must not linger on the leaderboard showing a 0 — that
+        // pushes legitimate active users out of the visible top list. Persist
+        // the leaderboard with the stale entry dropped (the loop above already
+        // removed it) and stop before re-inserting. We intentionally leave the
+        // user's reputation/review records intact: those hold history (and
+        // accumulator-only score such as dispute outcomes) that must survive a
+        // dormant period and is unrelated to leaderboard visibility.
+        if new_score == 0 && new_weight == 0 {
+            env.storage().instance().set(&leaderboard_key, &leaderboard);
+            env.storage()
+                .instance()
+                .extend_ttl(MIN_TTL_THRESHOLD, MIN_TTL_EXTEND_TO);
+            return;
+        }
+
+        let avg_rating = match Self::get_average_rating(env.clone(), reviewee.clone()) {
+            Ok(rating) => rating,
+            Err(_) => {
+                // Reputation vanished between reads — persist the removal so a
+                // stale entry is not left behind, then stop.
+                env.storage().instance().set(&leaderboard_key, &leaderboard);
+                env.storage()
+                    .instance()
+                    .extend_ttl(MIN_TTL_THRESHOLD, MIN_TTL_EXTEND_TO);
+                return;
+            }
+        };
+
         // Insert at correct position (descending by rating)
         let mut inserted = false;
         let mut pos: u32 = 0;
@@ -1698,13 +2517,8 @@ impl ReputationContract {
             pos += 1;
         }
 
-        if !inserted && leaderboard.len() < TOP_N {
+        if !inserted {
             leaderboard.push_back((reviewee.clone(), avg_rating));
-        }
-
-        // Truncate to top N
-        while leaderboard.len() > TOP_N {
-            leaderboard.pop_back();
         }
 
         env.storage().instance().set(&leaderboard_key, &leaderboard);
@@ -1781,7 +2595,7 @@ impl ReputationContract {
                     total_score: 0,
                     total_weight: 0,
                     review_count: 0,
-                    last_updated_ledger: env.ledger().sequence(),
+                    last_updated_ts: env.ledger().timestamp() as u32,
                 });
 
             apply_lazy_decay(&env, &mut reputation);
@@ -1789,7 +2603,7 @@ impl ReputationContract {
             reputation.total_score = reputation.total_score.saturating_sub(removed_score);
             reputation.total_weight = reputation.total_weight.saturating_sub(removed_weight);
             reputation.review_count = reputation.review_count.saturating_sub(1);
-            reputation.last_updated_ledger = env.ledger().sequence();
+            reputation.last_updated_ts = env.ledger().timestamp() as u32;
             env.storage().persistent().set(&rep_key, &reputation);
             bump_reputation_ttl(&env, &reviewee);
 
@@ -1804,6 +2618,75 @@ impl ReputationContract {
         env.events().publish(
             (symbol_short!("reput"), symbol_short!("ap_reslv")),
             (admin, reviewer, reviewee, job_id, remove),
+        );
+
+        Ok(())
+    }
+
+    /// Admin: remove a review by index from a user's stored reviews.
+    /// - Requires admin auth (registered signer).
+    /// - Removes the review at `review_index` from `DataKey::Reviews(user)`.
+    /// - Does NOT recompute the aggregate; totals are recomputed lazily on read.
+    /// - Emits an event for audit: ("reput", "review_removed") -> (user, review_index, removed_by)
+    pub fn admin_remove_review(
+        env: Env,
+        admin: Address,
+        user: Address,
+        review_index: u32,
+    ) -> Result<(), ReputationError> {
+        admin.require_auth();
+        require_not_paused(&env)?;
+        if !is_signer(&env, &admin) {
+            return Err(ReputationError::NotAdmin);
+        }
+
+        let reviews_key = DataKey::Reviews(user.clone());
+        let mut reviews: Vec<Review> = env
+            .storage()
+            .persistent()
+            .get(&reviews_key)
+            .unwrap_or(Vec::new(&env));
+
+        if review_index >= reviews.len() {
+            return Err(ReputationError::ReviewNotFound);
+        }
+
+        let removed = reviews.get(review_index).unwrap();
+        let reviewer = removed.reviewer.clone();
+        let job_id = removed.job_id;
+
+        reviews.remove(review_index);
+        env.storage().persistent().set(&reviews_key, &reviews);
+        bump_reviews_ttl(&env, &user);
+
+        let review_exists_key = DataKey::ReviewExists(reviewer.clone(), user.clone(), job_id);
+        if env.storage().persistent().has(&review_exists_key) {
+            env.storage().persistent().remove(&review_exists_key);
+        }
+
+        // Resolve any pending appeal on the removed review so both removal
+        // paths (admin_remove_review and admin_resolve_appeal) leave
+        // consistent appeal state (#981).
+        let appeal_key = DataKey::ReviewAppeal(reviewer.clone(), user.clone(), job_id);
+        if let Some(mut appeal) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ReviewAppeal>(&appeal_key)
+        {
+            if appeal.status == AppealStatus::Pending {
+                appeal.status = AppealStatus::ReviewRemoved;
+                env.storage().persistent().set(&appeal_key, &appeal);
+                bump_review_appeal_ttl(&env, &reviewer, &user, job_id);
+            }
+        }
+
+        // Do NOT update legacy accumulators here; recomputation is lazy on next read.
+
+        // NOTE: Soroban symbol literals have a hard 9-character limit.
+        // Keep event topic symbols <= 9 chars.
+        env.events().publish(
+            (symbol_short!("reput"), symbol_short!("rev_rm")),
+            (user, review_index, admin),
         );
 
         Ok(())
@@ -1828,6 +2711,9 @@ impl ReputationContract {
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod proptest_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1868,7 +2754,7 @@ mod tests {
                     total_score: (rating as u64) * (MIN_REVIEW_STAKE_DEFAULT as u64),
                     total_weight: MIN_REVIEW_STAKE_DEFAULT as u64,
                     review_count: 1,
-                    last_updated_ledger: env.ledger().sequence(),
+                    last_updated_ts: env.ledger().timestamp() as u32,
                 },
             );
         });
@@ -1933,6 +2819,46 @@ mod tests {
         );
     }
 
+    // Seeds both the `Reputation` accumulator and a matching `Reviews` entry so
+    // that `get_decayed_totals` (used by `get_score_badge`) reports the same score as
+    // the raw `total_score` when no decay has elapsed (issue #976).
+    fn seed_reputation_with_review(
+        env: &Env,
+        contract_id: &Address,
+        user: &Address,
+        total_score: u64,
+        total_weight: u64,
+        review_count: u32,
+    ) {
+        env.as_contract(contract_id, || {
+            env.storage().persistent().set(
+                &DataKey::Reputation(user.clone()),
+                &UserReputation {
+                    user: user.clone(),
+                    total_score,
+                    total_weight,
+                    review_count,
+                    last_updated_ts: 0,
+                },
+            );
+            env.storage().persistent().set(
+                &DataKey::Reviews(user.clone()),
+                &Vec::from_array(
+                    env,
+                    [Review {
+                        reviewer: user.clone(),
+                        reviewee: user.clone(),
+                        job_id: 0,
+                        rating: total_score as u32,
+                        comment: String::from_str(env, ""),
+                        stake_weight: 1,
+                        timestamp: 0,
+                    }],
+                ),
+            );
+        });
+    }
+
     #[test]
     fn test_get_badge() {
         let env = Env::default();
@@ -1942,63 +2868,132 @@ mod tests {
         let user = Address::generate(&env);
 
         // Test no badge for user with no reputation
-        assert_eq!(client.get_badge(&user), None);
+        assert_eq!(client.get_score_badge(&user), None);
 
-        // Test Bronze badge (score >= 100)
-        env.as_contract(&contract_id, || {
-            env.storage().persistent().set(
-                &DataKey::Reputation(user.clone()),
-                &UserReputation {
-                    user: user.clone(),
-                    total_score: 100,
-                    total_weight: 10,
-                    review_count: 1,
-                },
-            );
-        });
-        assert_eq!(client.get_badge(&user), Some(Badge::Bronze));
+        // Test Rising badge (score >= 100)
+        seed_reputation_with_review(&env, &contract_id, &user, 100, 10, 1);
+        assert_eq!(client.get_score_badge(&user), Some(ScoreBadge::Rising));
 
-        // Test Silver badge (score >= 500)
-        env.as_contract(&contract_id, || {
-            env.storage().persistent().set(
-                &DataKey::Reputation(user.clone()),
-                &UserReputation {
-                    user: user.clone(),
-                    total_score: 500,
-                    total_weight: 50,
-                    review_count: 5,
-                },
-            );
-        });
-        assert_eq!(client.get_badge(&user), Some(Badge::Silver));
+        // Test Established badge (score >= 500)
+        seed_reputation_with_review(&env, &contract_id, &user, 500, 50, 5);
+        assert_eq!(client.get_score_badge(&user), Some(ScoreBadge::Established));
 
-        // Test Gold badge (score >= 2000)
-        env.as_contract(&contract_id, || {
-            env.storage().persistent().set(
-                &DataKey::Reputation(user.clone()),
-                &UserReputation {
-                    user: user.clone(),
-                    total_score: 2000,
-                    total_weight: 200,
-                    review_count: 20,
-                },
-            );
-        });
-        assert_eq!(client.get_badge(&user), Some(Badge::Gold));
+        // Test Elite badge (score >= 2000)
+        seed_reputation_with_review(&env, &contract_id, &user, 2000, 200, 20);
+        assert_eq!(client.get_score_badge(&user), Some(ScoreBadge::Elite));
 
         // Test no badge for score < 100
-        env.as_contract(&contract_id, || {
+        seed_reputation_with_review(&env, &contract_id, &user, 99, 10, 1);
+        assert_eq!(client.get_score_badge(&user), None);
+    }
+
+    /// #1172 — the deprecated `get_badge` name must keep answering exactly like
+    /// `get_score_badge` so existing integrations are unaffected by the rename.
+    #[test]
+    fn test_get_badge_alias_matches_get_score_badge() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &contract_id);
+
+        let user = Address::generate(&env);
+        assert_eq!(client.get_badge(&user), client.get_score_badge(&user));
+
+        for (score, weight, count) in [(99u64, 10u64, 1u32), (100, 10, 1), (500, 50, 5), (2000, 200, 20)] {
+            seed_reputation_with_review(&env, &contract_id, &user, score, weight, count);
+            assert_eq!(client.get_badge(&user), client.get_score_badge(&user));
+        }
+    }
+
+    /// Seed `count` reviews of the given rating and stake weight, so a test can
+    /// control `total_score` (Σ rating × weight) and `total_weight` (Σ weight)
+    /// independently of each other.
+    fn seed_reviews(
+        env: &Env,
+        contract_id: &Address,
+        user: &Address,
+        rating: u32,
+        stake_weight: i128,
+        count: u32,
+    ) {
+        env.as_contract(contract_id, || {
+            let mut reviews = Vec::new(env);
+            for _ in 0..count {
+                reviews.push_back(Review {
+                    reviewer: user.clone(),
+                    reviewee: user.clone(),
+                    job_id: 0,
+                    rating,
+                    comment: String::from_str(env, ""),
+                    stake_weight,
+                    timestamp: 0,
+                });
+            }
             env.storage().persistent().set(
                 &DataKey::Reputation(user.clone()),
                 &UserReputation {
                     user: user.clone(),
-                    total_score: 99,
-                    total_weight: 10,
-                    review_count: 1,
+                    total_score: 0,
+                    total_weight: 0,
+                    review_count: count,
+                    last_updated_ts: 0,
                 },
             );
+            env.storage()
+                .persistent()
+                .set(&DataKey::Reviews(user.clone()), &reviews);
         });
-        assert_eq!(client.get_badge(&user), None);
+    }
+
+    /// #1172 — the score badge and the rating tier are separate ladders. A user with
+    /// one small perfect review ranks high on quality and nowhere on volume; a user
+    /// with lots of mediocre, heavily-staked reviews does the opposite. This pins
+    /// that divergence so the two are never "fixed" into agreement.
+    #[test]
+    fn test_score_badge_and_rating_tier_are_independent_ladders() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &contract_id);
+
+        // One 5★ review of weight 1: average_rating = 5 * 100 / 1 = 500 -> Gold
+        // tier, but total_score = 5 -> below the score ladder's first rung.
+        let sparse = Address::generate(&env);
+        seed_reviews(&env, &contract_id, &sparse, 5, 1, 1);
+        assert_eq!(client.get_tier(&sparse), ReputationTier::Gold);
+        assert_eq!(client.get_score_badge(&sparse), None);
+
+        // Ten 2★ reviews of weight 100: total_score = 2000 -> Elite badge, while
+        // average_rating = 2000 * 100 / 1000 = 200 -> only Bronze tier.
+        let prolific = Address::generate(&env);
+        seed_reviews(&env, &contract_id, &prolific, 2, 100, 10);
+        assert_eq!(client.get_score_badge(&prolific), Some(ScoreBadge::Elite));
+        assert_eq!(client.get_tier(&prolific), ReputationTier::Bronze);
+    }
+
+    #[test]
+    fn test_get_badge_matches_get_tier_after_full_decay() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        // 100% decay rate per year so the score fully decays after one year.
+        client.initialize(&vec![&env, admin.clone()], &1, &100);
+
+        let user = Address::generate(&env);
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        seed_reputation_with_review(&env, &contract_id, &user, 2000, 200, 20);
+
+        // Freshly earned: both views agree the user has standing.
+        assert_eq!(client.get_score_badge(&user), Some(ScoreBadge::Elite));
+        assert_ne!(client.get_tier(&user), ReputationTier::None);
+
+        // Advance a full year so the review fully decays.
+        env.ledger()
+            .with_mut(|l| l.timestamp = ONE_YEAR_IN_SECONDS);
+
+        assert_eq!(client.get_score_badge(&user), None);
+        assert_eq!(client.get_tier(&user), ReputationTier::None);
     }
 
     #[test]
@@ -2026,6 +3021,7 @@ mod tests {
                     total_score: 500,
                     total_weight: 50,
                     review_count: 5,
+                    last_updated_ts: 0,
                 },
             );
         });
@@ -2069,6 +3065,7 @@ mod tests {
                     total_score: 100,
                     total_weight: 10,
                     review_count: 1,
+                    last_updated_ts: 0,
                 },
             );
         });
@@ -2121,5 +3118,168 @@ mod tests {
 
         // Try to call without dispute contract set
         client.apply_dispute_outcome(&user, &DisputeOutcome::Won);
+    }
+
+    #[test]
+    fn test_admin_remove_review_by_index() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&vec![&env, admin.clone()], &1, &0);
+
+        let reviewee = Address::generate(&env);
+        let reviewer1 = Address::generate(&env);
+        let reviewer2 = Address::generate(&env);
+        let reviewer3 = Address::generate(&env);
+
+        // Create three reviews: ratings 5,3,4 each with MIN_REVIEW_STAKE_DEFAULT weight
+        let r1 = Review {
+            reviewer: reviewer1.clone(),
+            reviewee: reviewee.clone(),
+            job_id: 1,
+            rating: 5,
+            comment: String::from_str(&env, "r1"),
+            stake_weight: MIN_REVIEW_STAKE_DEFAULT,
+            timestamp: env.ledger().timestamp(),
+        };
+        let r2 = Review {
+            reviewer: reviewer2.clone(),
+            reviewee: reviewee.clone(),
+            job_id: 2,
+            rating: 3,
+            comment: String::from_str(&env, "r2"),
+            stake_weight: MIN_REVIEW_STAKE_DEFAULT,
+            timestamp: env.ledger().timestamp(),
+        };
+        let r3 = Review {
+            reviewer: reviewer3.clone(),
+            reviewee: reviewee.clone(),
+            job_id: 3,
+            rating: 4,
+            comment: String::from_str(&env, "r3"),
+            stake_weight: MIN_REVIEW_STAKE_DEFAULT,
+            timestamp: env.ledger().timestamp(),
+        };
+
+        let reviews = vec![&env, r1, r2, r3];
+        // Set persisted reviews and review_exists flags and a legacy reputation record
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Reviews(reviewee.clone()), &reviews);
+
+            env.storage().persistent().set(
+                &DataKey::ReviewExists(reviewer1.clone(), reviewee.clone(), 1),
+                &true,
+            );
+            env.storage().persistent().set(
+                &DataKey::ReviewExists(reviewer2.clone(), reviewee.clone(), 2),
+                &true,
+            );
+            env.storage().persistent().set(
+                &DataKey::ReviewExists(reviewer3.clone(), reviewee.clone(), 3),
+                &true,
+            );
+
+            // Legacy accumulator: sum ratings * weight
+            let total_score = (5u64 + 3u64 + 4u64) * (MIN_REVIEW_STAKE_DEFAULT as u64);
+            let total_weight = 3u64 * (MIN_REVIEW_STAKE_DEFAULT as u64);
+            env.storage().persistent().set(
+                &DataKey::Reputation(reviewee.clone()),
+                &UserReputation {
+                    user: reviewee.clone(),
+                    total_score,
+                    total_weight,
+                    review_count: 3,
+                    last_updated_ts: env.ledger().timestamp() as u32,
+                },
+            );
+        });
+
+        // Sanity check: average rating should be 400 ( (12/3)*100 )
+        let before = client.get_average_rating(&reviewee);
+        assert_eq!(before, 400);
+
+        // Admin removes index 1 (the middle review with rating 3)
+        client.admin_remove_review(&admin, &reviewee, &1);
+
+        // Reviews length should be 2 now
+        assert_eq!(client.get_reviews(&reviewee).len(), 2);
+
+        // New average should be ((5+4)/2)*100 = 450
+        let after = client.get_average_rating(&reviewee);
+        assert_eq!(after, 450);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #14)")]
+    fn test_admin_remove_review_unauthorized_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&vec![&env, admin.clone()], &1, &0);
+
+        let non_admin = Address::generate(&env);
+        let reviewee = Address::generate(&env);
+
+        // Call without being a registered signer — should panic with NotAdmin
+        client.admin_remove_review(&non_admin, &reviewee, &0);
+    }
+
+    #[test]
+    fn test_dispute_outcome_decay_behavior() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        // Initialize with default decay rate of 10% (10u32)
+        client.initialize(&vec![&env, admin.clone()], &1, &10);
+
+        let dispute_contract = Address::generate(&env);
+        client.set_dispute_contract(&admin, &dispute_contract);
+
+        let user = Address::generate(&env);
+
+        // 1. New user has their first reputation event via dispute outcome.
+        // Timestamp is 500,000.
+        env.ledger().with_mut(|l| l.timestamp = 500_000);
+        client.apply_dispute_outcome(&user, &DisputeOutcome::Won);
+
+        // Verify the user's reputation was created, total_score = 50, and last_updated_ts is 500,000.
+        let rep_before: UserReputation = env.as_contract(&contract_id, || {
+            env.storage().persistent()
+                .get(&DataKey::Reputation(user.clone()))
+                .unwrap()
+        });
+        assert_eq!(rep_before.total_score, 50);
+        assert_eq!(rep_before.last_updated_ts, 500_000);
+
+        // 2. Advance time by 1 year (31,536,000 seconds) so that 10% decay applies.
+        env.ledger().with_mut(|l| l.timestamp = 500_000 + 31_536_000);
+
+        // Perform an unrelated action or a second dispute outcome to trigger lazy decay.
+        // We will call apply_dispute_outcome with Won (+50) again.
+        // With 10% decay, the original 50 score should decay to 45.
+        // Then +50 is added, resulting in 95.
+        client.apply_dispute_outcome(&user, &DisputeOutcome::Won);
+
+        let rep_after: UserReputation = env.as_contract(&contract_id, || {
+            env.storage().persistent()
+                .get(&DataKey::Reputation(user.clone()))
+                .unwrap()
+        });
+        assert_eq!(rep_after.total_score, 95);
+        assert_eq!(rep_after.last_updated_ts, 500_000 + 31_536_000);
     }
 }

@@ -2,38 +2,35 @@
 
 import { useEffect, useState } from "react";
 import { ShieldCheck, Users } from "lucide-react";
-import { useDisputeStatus } from "@/hooks/useDisputeStatus";
-import type { Vote } from "@/types";
+import { useOptionalDisputeState } from "@/context/DisputeStateContext";
+import type { Dispute, Vote } from "@/types";
 
 interface DisputeVoteProgressProps {
-  disputeId: string;
+  /**
+   * Optional explicit dispute. When omitted, the component reads from the shared
+   * `DisputeStateProvider` on the dispute page — the SAME source that gates the
+   * "Finalize & Resolve" button — so the two can never disagree (#1126).
+   */
+  initialDispute?: Dispute;
   showVoterDetails?: boolean;
-  initialDispute?: any; // eslint-disable-line @typescript-eslint/no-explicit-any
 }
 
 /**
- * Real-time dispute vote progress tracker component
- * 
- * Features:
- * - Live polling via useDisputeStatus hook
- * - Visual split progress bar showing votes for client vs freelancer
- * - Vote count display (X of Y votes cast)
- * - Anonymized voter addresses for privacy
- * - Responsive design with Tailwind CSS
+ * Dispute vote-progress tracker.
+ *
+ * Reads vote/status from the single shared dispute state (issue #1126) rather
+ * than running its own independent poll, so its "Ready to resolve" message and
+ * the page's resolve-button gate always reflect the exact same data. An explicit
+ * `initialDispute` prop overrides the context for standalone/testing use.
  */
-export default function DisputeVoteProgress({ 
-  disputeId, 
-  showVoterDetails = false,
+export default function DisputeVoteProgress({
   initialDispute,
+  showVoterDetails = false,
 }: DisputeVoteProgressProps) {
-  const { dispute: liveDispute, isLoading: liveLoading } = useDisputeStatus({
-    disputeId,
-    enabled: !initialDispute,
-    initialInterval: 2000,
-    maxInterval: 30000
-  });
-  const dispute = initialDispute ?? liveDispute;
-  const isLoading = initialDispute ? false : liveLoading;
+  const shared = useOptionalDisputeState();
+  const dispute = initialDispute ?? shared?.dispute ?? null;
+  // Loading only when we have neither an explicit dispute nor shared state yet.
+  const isLoading = initialDispute ? false : shared?.loading ?? true;
 
   const [prevVoteCount, setPrevVoteCount] = useState(0);
   const [isNewVote, setIsNewVote] = useState(false);

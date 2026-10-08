@@ -1,4 +1,22 @@
 import { DisputeService } from "../services/dispute.service";
+import { ContractService } from "../services/contract.service";
+import { ReputationCacheService } from "../services/reputation-cache.service";
+
+jest.mock("../services/contract.service", () => ({
+  ContractService: {
+    getOnChainAssignedArbitrators: jest.fn(),
+  },
+}));
+
+jest.mock("../services/dispute-event.service", () => ({
+  recordDisputeEvent: jest.fn().mockResolvedValue({ id: 1 }),
+}));
+
+jest.mock("../services/reputation-cache.service", () => ({
+  ReputationCacheService: {
+    invalidateCache: jest.fn().mockResolvedValue(undefined),
+  },
+}));
 
 // Local runtime-friendly enums for tests (use string literals to avoid TS value/type mismatch
 // when importing generated Prisma types). This keeps tests stable and avoids relying on the
@@ -18,10 +36,37 @@ const JobStatus = {
 } as const;
 
 // ─── Prisma mock ─────────────────────────────────────────────────────────────
+type MockPrismaClient = {
+  user: {
+    findUnique: jest.Mock;
+    findFirst: jest.Mock;
+  };
+  job: {
+    findUnique: jest.Mock;
+    update: jest.Mock;
+  };
+  dispute: {
+    create: jest.Mock;
+    findUnique: jest.Mock;
+    findMany: jest.Mock;
+    update: jest.Mock;
+    count: jest.Mock;
+  };
+  disputeVote: {
+    create: jest.Mock;
+    findUnique: jest.Mock;
+    findMany: jest.Mock;
+    count: jest.Mock;
+  };
+  $disconnect: jest.Mock;
+  $transaction: jest.Mock;
+};
+
 jest.mock("@prisma/client", () => {
-  const mockPrisma = {
+  const mockPrisma: MockPrismaClient = {
     user: {
       findUnique: jest.fn(),
+      findFirst: jest.fn(),
     },
     job: {
       findUnique: jest.fn(),
@@ -38,36 +83,47 @@ jest.mock("@prisma/client", () => {
       create: jest.fn(),
       findUnique: jest.fn(),
       findMany: jest.fn(),
+      count: jest.fn(),
     },
     $disconnect: jest.fn(),
+    $transaction: jest.fn(
+      async (cb: (tx: MockPrismaClient) => Promise<unknown>) => await cb(mockPrisma),
+    ),
   };
 
   return {
-    PrismaClient: jest.fn(() => mockPrisma) as any,
+    PrismaClient: jest.fn(() => mockPrisma),
     DisputeStatus: {
       OPEN: "OPEN",
       IN_PROGRESS: "IN_PROGRESS",
       RESOLVED: "RESOLVED",
-    } as any,
+    },
     JobStatus: {
       OPEN: "OPEN",
       IN_PROGRESS: "IN_PROGRESS",
       COMPLETED: "COMPLETED",
       CANCELLED: "CANCELLED",
       DISPUTED: "DISPUTED",
-    } as any,
+    },
     EscrowStatus: {
       UNFUNDED: "UNFUNDED",
       FUNDED: "FUNDED",
       COMPLETED: "COMPLETED",
       CANCELLED: "CANCELLED",
       DISPUTED: "DISPUTED",
-    } as any,
+    },
+    DisputeEventType: {
+      DISPUTE_OPENED: "DISPUTE_OPENED",
+      EVIDENCE_SUBMITTED: "EVIDENCE_SUBMITTED",
+      ARBITRATOR_ASSIGNED: "ARBITRATOR_ASSIGNED",
+      VOTE_CAST: "VOTE_CAST",
+      VERDICT_REACHED: "VERDICT_REACHED",
+    },
   };
 });
 
 import { PrismaClient } from "@prisma/client";
-const prismaMock = new PrismaClient() as any;
+const prismaMock = new PrismaClient() as unknown as MockPrismaClient;
 
 // ─── Test data ────────────────────────────────────────────────────────────────
 const clientId = "00000000-0000-4000-8000-000000000001";
@@ -199,6 +255,7 @@ describe("Dispute Management System", () => {
         attachments: [],
       };
       prismaMock.dispute.findUnique.mockResolvedValueOnce(fullDispute);
+      prismaMock.disputeVote.findMany.mockResolvedValueOnce([]);
 
       const dispute = await DisputeService.getDisputeById(disputeId);
 
@@ -215,6 +272,55 @@ describe("Dispute Management System", () => {
       await expect(
         DisputeService.getDisputeById("non-existent-id"),
       ).rejects.toThrow("Dispute not found");
+    });
+
+    it("should retrieve on-chain arbitrators and join user profiles if profile exists", async () => {
+      const fullDispute = {
+        ...mockDispute,
+        onChainDisputeId: "12345",
+        votes: [],
+        attachments: [],
+      };
+      prismaMock.dispute.findUnique.mockResolvedValueOnce(fullDispute);
+      prismaMock.disputeVote.findMany.mockResolvedValueOnce([]);
+      (ContractService.getOnChainAssignedArbitrators as jest.Mock).mockResolvedValueOnce(["GARBITRATOR123"]);
+      prismaMock.user.findFirst.mockResolvedValueOnce({
+        username: "arb_user",
+        avatarUrl: "http://example.com/avatar.png",
+      });
+
+      const dispute = await DisputeService.getDisputeById(disputeId);
+
+      expect(dispute.arbitrators).toEqual([
+        {
+          address: "GARBITRATOR123",
+          displayName: "arb_user",
+          avatarUrl: "http://example.com/avatar.png",
+        },
+      ]);
+    });
+
+    it("should retrieve on-chain arbitrators and fallback to truncated address if profile does not exist", async () => {
+      const fullDispute = {
+        ...mockDispute,
+        onChainDisputeId: "12345",
+        votes: [],
+        attachments: [],
+      };
+      prismaMock.dispute.findUnique.mockResolvedValueOnce(fullDispute);
+      prismaMock.disputeVote.findMany.mockResolvedValueOnce([]);
+      (ContractService.getOnChainAssignedArbitrators as jest.Mock).mockResolvedValueOnce(["GARBITRATOR123"]);
+      prismaMock.user.findFirst.mockResolvedValueOnce(null);
+
+      const dispute = await DisputeService.getDisputeById(disputeId);
+
+      expect(dispute.arbitrators).toEqual([
+        {
+          address: "GARBITRATOR123",
+          displayName: "GARB...R123",
+          avatarUrl: null,
+        },
+      ]);
     });
   });
 
@@ -273,6 +379,7 @@ describe("Dispute Management System", () => {
       prismaMock.dispute.findUnique.mockResolvedValueOnce(mockDispute);
       prismaMock.disputeVote.findUnique.mockResolvedValueOnce(null);
       prismaMock.disputeVote.create.mockResolvedValueOnce(mockVote);
+      prismaMock.disputeVote.count.mockResolvedValueOnce(1);
       prismaMock.dispute.update.mockResolvedValueOnce({
         ...mockDispute,
         status: DisputeStatus.IN_PROGRESS,
@@ -361,6 +468,7 @@ describe("Dispute Management System", () => {
         votes: [],
       });
       prismaMock.dispute.update.mockResolvedValueOnce(resolvedDispute);
+      prismaMock.disputeVote.count.mockResolvedValueOnce(0);
       prismaMock.job.update.mockResolvedValueOnce({
         ...mockJob,
         status: JobStatus.COMPLETED,
@@ -375,6 +483,14 @@ describe("Dispute Management System", () => {
       expect(dispute.status).toBe(DisputeStatus.RESOLVED);
       expect(dispute.outcome).toBe("Resolved in favor of client");
       expect(dispute.resolvedAt).toBeDefined();
+
+      expect(ReputationCacheService.invalidateCache).toHaveBeenCalledWith(
+        mockClient.walletAddress,
+      );
+      expect(ReputationCacheService.invalidateCache).toHaveBeenCalledWith(
+        mockFreelancer.walletAddress,
+      );
+      expect(ReputationCacheService.invalidateCache).toHaveBeenCalledTimes(2);
     });
 
     it("should prevent resolving already resolved dispute", async () => {
@@ -414,7 +530,7 @@ describe("Dispute Management System", () => {
     it("should handle unknown webhook type", async () => {
       await expect(
         DisputeService.processWebhook({
-          type: "UNKNOWN_TYPE" as any,
+          type: "UNKNOWN_TYPE",
           disputeId: "test",
         }),
       ).rejects.toThrow("Unknown webhook type");

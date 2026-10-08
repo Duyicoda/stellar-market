@@ -128,7 +128,7 @@
             },
             "ext": "v0"
           },
-          518400
+          6311999
         ]
       ],
       [
@@ -149,7 +149,7 @@
             },
             "ext": "v0"
           },
-          518400
+          6311999
         ]
       ]
     ]
@@ -189,7 +189,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "u32": 1001
+                  "u32": 501
                 },
                 {
                   "u64": 604800
@@ -292,7 +292,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                     },
                     {
-                      "u32": 1001
+                      "u32": 501
                     },
                     {
                       "u64": 604800
@@ -402,7 +402,7 @@
                       "symbol": "SetFeeBps"
                     },
                     {
-                      "u32": 1001
+                      "u32": 501
                     }
                   ]
                 }
@@ -412,46 +412,6 @@
         }
       },
       "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
-        "type_": "contract",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "msig"
-              },
-              {
-                "symbol": "proposed"
-              }
-            ],
-            "data": {
-              "vec": [
-                {
-                  "u64": 1
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                },
-                {
-                  "vec": [
-                    {
-                      "symbol": "SetFeeBps"
-                    },
-                    {
-                      "u32": 1001
-                    }
-                  ]
-                }
-              ]
-            }
-          }
-        }
-      },
-      "failed_call": true
     },
     {
       "event": {
@@ -539,7 +499,7 @@
                           "symbol": "SetFeeBps"
                         },
                         {
-                          "u32": 1001
+                          "u32": 501
                         }
                       ]
                     }

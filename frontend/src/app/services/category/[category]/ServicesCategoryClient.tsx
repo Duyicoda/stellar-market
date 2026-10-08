@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   Search,
   SlidersHorizontal,
@@ -17,7 +17,7 @@ import { useServiceFilters } from "@/hooks/useServiceFilters";
 import { useInfiniteScroll } from "@/hooks/useInfiniteScroll";
 import { ServiceListing, PaginatedResponse } from "@/types";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api/v1";
 const SERVICES_PER_PAGE = 10;
 
 const POPULAR_SKILLS = [
@@ -80,8 +80,6 @@ export default function ServicesCategoryClient({
     maxPrice: filters.maxPrice,
     sort: filters.sort,
   });
-  const prevFilterKey = useRef(filterKey);
-
   const buildParams = useCallback(
     (p: number) => {
       const params: Record<string, string | number> = {
@@ -144,9 +142,6 @@ export default function ServicesCategoryClient({
   }, [loadingMore, hasMore, page, buildParams]);
 
   useEffect(() => {
-    if (prevFilterKey.current !== filterKey) {
-      prevFilterKey.current = filterKey;
-    }
     fetchFirstPage();
   }, [filterKey]);
 

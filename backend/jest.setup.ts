@@ -1,1 +1,108 @@
 // Jest setup file — intentionally minimal
+
+// ─── Environment Variables for Tests ─────────────────────────────────────────
+process.env.ENCRYPTION_KEY =
+  process.env.ENCRYPTION_KEY ||
+  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+process.env.NATIVE_TOKEN_ID =
+  process.env.NATIVE_TOKEN_ID ||
+  "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+
+// ─── src/config/redis ────────────────────────────────────────────────────────
+// Prevent Redis TCP connections during tests.
+//
+// auth.2fa.test.ts (and other auth tests) import auth.routes.ts which imports
+// rate-limit.ts which calls getRedisClient() at module level. getRedisClient()
+// launches a real ioredis connection that retries with delays (200ms, 400ms,
+// 800ms). Those deferred retry rejections fire during later test files and
+// jest catches them as blank-error failures in whatever test happens to be
+// running at that moment (e.g. transaction.routes.test.ts).
+//
+// Returning null here makes every rate-limiter fall back to MemoryStore and
+// stops any TCP connection from being opened during the test run.
+jest.mock("./src/config/redis", () => ({
+  getRedisClient: jest.fn().mockReturnValue(null),
+  RECOMMENDATION_CACHE_PREFIX: "recommendations:",
+  RECOMMENDATION_CACHE_TTL: 600,
+}));
+
+// ─── src/lib/redis ───────────────────────────────────────────────────────────
+// RedisClient is a singleton that opens a real ioredis TCP connection when
+// getInstance() is first called. Modules like notification-queue.ts,
+// recommendation-queue.service.ts, auth.routes.ts, and report.routes.ts call
+// getInstance() at module-load time (top-level), which triggers a real
+// connection attempt (ECONNREFUSED) even in tests that don't need Redis.
+//
+// We replace the entire module with a no-op mock that satisfies all call sites
+// without opening any network connections.
+const mockRedisInstance = {
+  // ioredis command stubs used by notification-queue worker
+  incr: jest.fn().mockResolvedValue(1),
+  expire: jest.fn().mockResolvedValue(1),
+  rpush: jest.fn().mockResolvedValue(1),
+  lpop: jest.fn().mockResolvedValue(null),
+  // Serve token-version.ts's auth cache lookup (issue #787) a fixed cached
+  // value so it never falls through to an uncounted prisma.user.findUnique
+  // call — tests that queue up exact findUnique sequences for their own
+  // assertions would otherwise have a slot silently consumed by this cache
+  // miss on every authenticated request.
+  get: jest.fn((key: string) =>
+    Promise.resolve(
+      typeof key === "string" && key.startsWith("auth:tokenVersion:") ? "0" : null,
+    ),
+  ),
+  set: jest.fn().mockResolvedValue("OK"),
+  setex: jest.fn().mockResolvedValue("OK"),
+  del: jest.fn().mockResolvedValue(1),
+  hget: jest.fn().mockResolvedValue(null),
+  hset: jest.fn().mockResolvedValue(1),
+  // ioredis event emitter stubs (BullMQ calls .on internally)
+  on: jest.fn().mockReturnThis(),
+  once: jest.fn().mockReturnThis(),
+  off: jest.fn().mockReturnThis(),
+  emit: jest.fn(),
+  // connection lifecycle
+  connect: jest.fn().mockResolvedValue(undefined),
+  quit: jest.fn().mockResolvedValue("OK"),
+  disconnect: jest.fn(),
+  status: "ready",
+};
+// notification-queue.ts and recommendation-queue.service.ts each duplicate the
+// shared client into a dedicated blocking-safe connection for their BullMQ
+// Worker; the mock doesn't need a distinct connection, so hand back itself.
+(mockRedisInstance as unknown as { duplicate: jest.Mock }).duplicate = jest
+  .fn()
+  .mockReturnValue(mockRedisInstance);
+
+jest.mock("./src/lib/redis", () => ({
+  __esModule: true,
+  default: {
+    getInstance: jest.fn().mockReturnValue(mockRedisInstance),
+    connect: jest.fn().mockResolvedValue(undefined),
+    disconnect: jest.fn().mockResolvedValue(undefined),
+    isRedisConnected: jest.fn().mockReturnValue(false),
+  },
+}));
+
+// ─── src/lib/notification-queue ──────────────────────────────────────────────
+// notification-queue.ts constructs a real BullMQ Queue (and connects to Redis)
+// at module load time via `new Queue("notifications", { connection })`.
+// Any test file that transitively imports a route or service touching this
+// module would trigger the connection. We replace the whole module with stubs.
+jest.mock("./src/lib/notification-queue", () => ({
+  notificationQueue: {
+    add: jest.fn().mockResolvedValue(undefined),
+    getFailed: jest.fn().mockResolvedValue([]),
+    close: jest.fn().mockResolvedValue(undefined),
+  },
+  startNotificationWorker: jest.fn(),
+  stopNotificationWorker: jest.fn().mockResolvedValue(undefined),
+  getDlqJobs: jest.fn().mockResolvedValue([]),
+  getNotificationPriority: jest.fn().mockReturnValue(3),
+  NotificationPriority: {
+    CRITICAL: 1,
+    HIGH: 2,
+    NORMAL: 3,
+    LOW: 4,
+  },
+}));

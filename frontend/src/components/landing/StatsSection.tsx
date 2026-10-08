@@ -3,8 +3,9 @@
 import React, { useEffect, useState } from "react";
 import axios from "axios";
 import Skeleton from "@/components/Skeleton";
+import Reveal from "./Reveal";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api/v1";
 
 interface PlatformStats {
   totalJobs: number;
@@ -73,7 +74,7 @@ export default function StatsSection() {
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="grid grid-cols-2 md:grid-cols-4 gap-8 text-center">
           {displayItems.map((item, index) => (
-            <div key={index} className="flex flex-col items-center justify-center">
+            <Reveal key={index} delay={index * 0.08} className="flex flex-col items-center justify-center">
               {loading ? (
                 <Skeleton className="h-10 w-24 mb-2 rounded-md" />
               ) : (
@@ -82,7 +83,7 @@ export default function StatsSection() {
                 </div>
               )}
               <div className="text-theme-text mt-1">{item.label}</div>
-            </div>
+            </Reveal>
           ))}
         </div>
       </div>

@@ -1,52 +1,89 @@
-#293 Fix: services page filter state is lost on browser back navigation — URL query params do not reflect selected filters
-Repo Avatar
-stellarmarket-labs/stellar-market
-Problem
-When a user selects filters on /services (category, price range, rating) and navigates to a service detail page, pressing browser Back resets all filters to their defaults. Filter state is held in React component state only, not URL params.
+# Open Issues
 
-Fix
-Sync filter values with URL search params using useSearchParams (Next.js App Router) or nuqs:
+## #733 — PWA install prompt is shown on every session
+**Status:** Open  
+Users who dismissed the PWA install / push notification banner see it again on every page load. No persistence of the user's decision exists — the component does not check `localStorage` before rendering.
 
-/services?category=design&minPrice=50&maxPrice=500&minRating=4
-On mount, initialise filter state from URL params so back-navigation restores the exact filtered view.
+**Required Changes — Frontend**
+- On dismiss, write `pwa_prompt_dismissed: true` and `pwa_prompt_dismissed_at: <timestamp>` to `localStorage`.
+- On mount, read `localStorage` and skip rendering if dismissed within the last 30 days.
+- On accept (permission granted), write `pwa_prompt_accepted: true` and never show again.
+- Provide a way to re-surface the prompt from the user settings page ("Enable notifications").
+
+**Acceptance Criteria**
+- [ ] Dismissed prompt does not re-appear within 30 days
+- [ ] Accepted prompt never re-appears
+- [ ] User can re-enable from settings
+
+**Labels:** `frontend` `enhancement` `ux`  
+**Effort:** 1 day
 
 
-#289 Build: add job and profile share button with copyable deep link — no social sharing or direct link feature exists
-Repo Avatar
-stellarmarket-labs/stellar-market
-Problem
-Users cannot easily share a job listing or freelancer profile with someone outside the platform. There is no share/copy-link affordance on job detail or profile pages.
+---
 
-Acceptance criteria
- Add a "Share" button to job detail and public profile pages.
- On click: copy canonical URL to clipboard + show "Link copied!" toast.
- If Web Share API is available (mobile), use native share sheet instead.
- OG/Twitter meta tags on these pages should include title, description, and preview image (see companion SEO issue)
+## #736 — Frontend has no global loading indicator for slow navigations
+**Status:** Open  
+Next.js App Router does not show a native loading bar between route transitions when data fetching happens server-side. Users on slow connections see a frozen UI for 1–3 seconds with no indication that navigation is in progress.
 
- #290 Build: add SEO metadata (og:title, og:description, canonical, Twitter card) to job and profile pages — all pages share identical generic meta tags
-Repo Avatar
-stellarmarket-labs/stellar-market
-Problem
-Every page on the site shares the same static Stellar Market and no Open Graph tags. Job listings and freelancer profiles that are shared externally show only a blank link preview with no context.
+**Required Changes — Frontend**
+- Install `nprogress` (or implement a custom top-of-page progress bar).
+- Wire it to the router using the App Router `usePathname` / `useSearchParams` change detection pattern.
+- Start the bar on navigation start, complete on the new page render.
+- Match the bar colour to the brand accent colour.
 
-Acceptance criteria
- Use Next.js generateMetadata (App Router) to set page-specific metadata.
- Job detail: og:title = job title, og:description = first 160 chars of description, og:image = generated OG image or platform default.
- Profile page: og:title = freelancer name + tagline, og:description = bio excerpt, og:image = avatar.
- Canonical tag on all pages.
- Twitter card summary_large_image meta.
+**Acceptance Criteria**
+- [ ] Progress bar appears at the top of the page on every navigation
+- [ ] Bar completes when the new page renders
+- [ ] No flash or double-render of the bar
 
- #288 Build: add mobile-responsive hamburger navigation — sidebar collapses on small screens but leaves no way to open it again
-Repo Avatar
-stellarmarket-labs/stellar-market
-Problem
-On viewports < 768 px the sidebar navigation collapses to nothing. There is no hamburger button or slide-out drawer to access navigation links, making the app unusable on mobile.
+**Labels:** `frontend` `enhancement` `ux`  
+**Effort:** < 1 day
 
-Acceptance criteria
- Add a hamburger icon button to the top navbar on mobile viewports.
- Tapping it opens a full-height slide-in drawer with all nav links.
- Drawer closes on link tap, backdrop tap, or swipe-left gesture.
- Active route is highlighted.
- Focus trap inside drawer for keyboard accessibility.
- Tested on iOS Safari and Android Chrome.
 
+---
+
+## #735 — Dispute raise modal does not show escrow balance before submission
+**Status:** Open  
+The `RaiseDisputeModal` collects dispute details and submits without first showing the current escrow balance. If the escrow has already been partially or fully released, the client may raise a dispute expecting funds that are not there.
+
+**Required Changes — Frontend**
+- On modal open, call `GET /escrow/:jobId` to fetch current balance and milestone release status.
+- Display a summary: "Escrow balance: X XLM — Y of Z milestones released."
+- If balance is 0, show a warning: "This escrow has no remaining balance. Raising a dispute will not result in a payout."
+- Allow submission regardless (the dispute may still be valid for reputational reasons).
+
+**Acceptance Criteria**
+- [ ] Escrow balance is shown before dispute submission
+- [ ] Zero-balance warning is clear and visible
+- [ ] User can still submit despite zero balance
+
+**Labels:** `frontend` `enhancement` `ux`  
+**Effort:** 1 day
+
+
+---
+
+## #732 — Freelancer profile has no availability status toggle
+**Status:** Open  
+Freelancer profiles show no availability signal. Clients have no way to know if a freelancer is actively accepting jobs, currently at capacity, or on a break.
+
+**Required Changes**
+
+**Backend:**
+- Add `availabilityStatus: "available" | "busy" | "unavailable"` to the `FreelancerProfile` Prisma model.
+- Default to `"available"` on profile creation.
+- Add `PATCH /freelancers/me/availability { status }` with freelancer auth.
+- Include `availabilityStatus` in the public profile response.
+
+**Frontend:**
+- Add a toggle/select on the freelancer dashboard settings: "Available", "Busy", "Unavailable".
+- Render a coloured badge on the freelancer profile card and detail page: green / amber / grey.
+- Clients browsing job applications see the badge next to each applicant name.
+
+**Acceptance Criteria**
+- [ ] Freelancer can set availability from their dashboard
+- [ ] Status badge is visible on profile cards and detail pages
+- [ ] Clients see availability status on job applicant lists
+
+**Labels:** `frontend` `backend` `enhancement`  
+**Effort:** 1–2 days

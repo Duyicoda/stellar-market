@@ -3,6 +3,7 @@ import HeroSection from "@/components/landing/HeroSection";
 import StatsSection from "@/components/landing/StatsSection";
 import HowItWorksSection from "@/components/landing/HowItWorksSection";
 import FeaturedJobsCarousel from "@/components/landing/FeaturedJobsCarousel";
+import FAQSection from "@/components/landing/FAQSection";
 import CTASection from "@/components/landing/CTASection";
 
 export const metadata = {
@@ -18,6 +19,7 @@ export default function Home() {
       <StatsSection />
       <HowItWorksSection />
       <FeaturedJobsCarousel />
+      <FAQSection />
       <CTASection />
     </div>
   );

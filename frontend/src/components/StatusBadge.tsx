@@ -13,10 +13,16 @@ const statusColors: Record<string, string> = {
 };
 
 interface StatusBadgeProps {
-  status: string;
+  status: string | null | undefined;
 }
 
 export default function StatusBadge({ status }: StatusBadgeProps) {
+  // `status` legitimately comes back missing on data fetched through the
+  // server-rendered, unauthenticated path (several server-sourced records —
+  // job, in particular — omit status-like fields from their public shape).
+  // Render nothing rather than crash the whole page on `undefined.replaceAll`.
+  if (!status) return null;
+
   const colors = statusColors[status] || "bg-theme-border/30 text-theme-text border-theme-border/30";
 
   return (

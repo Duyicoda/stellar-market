@@ -26,7 +26,12 @@ const AUTO_FLAG_THRESHOLD = 3;
 const reportRateLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 5,
-  keyGenerator: (req) => (req as AuthRequest).userId ?? req.ip ?? "anon",
+  keyGenerator: (req) => {
+    const userId = (req as AuthRequest).userId;
+    if (userId) return String(userId);
+    return (req.ip ?? req.socket?.remoteAddress ?? "anon").replace(/^::ffff:/i, "");
+  },
+  validate: { ip: false }, // IP is normalized in keyGenerator above
   standardHeaders: true,
   legacyHeaders: false,
   handler: (_req, res) => {
@@ -42,7 +47,7 @@ const TARGET_TYPES = ["JOB", "USER", "MESSAGE"] as const;
 
 const createReportSchema = z.object({
   targetType: z.enum(TARGET_TYPES),
-  targetId: z.string().min(1),
+  targetId: z.string().min(1).max(255),
   reason: z.string().min(10, "Reason must be at least 10 characters").max(1000),
 });
 
@@ -77,27 +82,11 @@ async function incrementReporterCount(reporterId: string): Promise<number> {
   }
 }
 
-/**
- * Read the current 24-hour report count for a reporter without incrementing.
- */
-async function getReporterCount(reporterId: string): Promise<number> {
-  try {
-    if (!RedisClient.isRedisConnected()) {
-      await RedisClient.connect();
-    }
-    const redis = RedisClient.getInstance();
-    const val = await redis.get(reporterCountKey(reporterId));
-    return val ? parseInt(val, 10) : 0;
-  } catch {
-    return 0;
-  }
-}
-
 // ─── Admin notification helper ────────────────────────────────────────────────
 
 async function notifyAdminsOfSuspiciousReporter(reporterId: string): Promise<void> {
   try {
-    const admins = await (prisma.user as any).findMany({
+    const admins = await prisma.user.findMany({
       where: { role: "ADMIN" },
       select: { id: true },
     });
@@ -106,7 +95,7 @@ async function notifyAdminsOfSuspiciousReporter(reporterId: string): Promise<voi
       (admins as { id: string }[]).map((admin) =>
         NotificationService.sendNotification({
           userId: admin.id,
-          type: "DISPUTE_RAISED", // reuse closest available type
+          type: "SUSPICIOUS_REPORTER_FLAGGED",
           title: "Suspicious Reporter Flagged",
           message: `User ${reporterId} has been auto-flagged as a suspicious reporter after exceeding ${REPORT_WINDOW_LIMIT} reports in 24 hours.`,
           metadata: { reporterId, threshold: REPORT_WINDOW_LIMIT },
@@ -145,7 +134,7 @@ router.post(
     };
 
     // ── 1. Check if reporter is already flagged as suspicious ──────────────
-    const reporter = await (prisma.user as any).findUnique({
+    const reporter = await prisma.user.findUnique({
       where: { id: reporterId },
       select: { isSuspiciousReporter: true },
     });
@@ -159,7 +148,7 @@ router.post(
     const requiresReview = alreadySuspicious || reportCount > REPORT_WINDOW_LIMIT;
 
     // ── 4. Persist the report ──────────────────────────────────────────────
-    const report = await (prisma as any).report.create({
+    const report = await prisma.report.create({
       data: {
         reporterId,
         targetType,
@@ -171,7 +160,7 @@ router.post(
 
     // ── 5. Flag reporter on first threshold breach ─────────────────────────
     if (!alreadySuspicious && reportCount >= REPORT_WINDOW_LIMIT) {
-      await (prisma.user as any).update({
+      await prisma.user.update({
         where: { id: reporterId },
         data: { isSuspiciousReporter: true },
       });
@@ -187,12 +176,12 @@ router.post(
 
     // ── 6. Legacy: auto-flag the target user when they accumulate reports ──
     if (targetType === "USER" && !requiresReview) {
-      const pendingCount = await (prisma as any).report.count({
+      const pendingCount = await prisma.report.count({
         where: { targetId, targetType: "USER", status: "PENDING" },
       });
 
       if (pendingCount >= AUTO_FLAG_THRESHOLD) {
-        await (prisma.user as any).update({
+        await prisma.user.update({
           where: { id: targetId },
           data: {
             isFlagged: true,

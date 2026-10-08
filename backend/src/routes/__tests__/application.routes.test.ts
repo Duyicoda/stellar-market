@@ -5,8 +5,27 @@ import { config } from "../../config";
 import applicationRouter from "../application.routes";
 
 // ─── Prisma & NotificationService mocks ───────────────────────────────────────
+type MockPrismaClient = {
+  job: {
+    findUnique: jest.Mock;
+    update: jest.Mock;
+  };
+  application: {
+    create: jest.Mock;
+    findUnique: jest.Mock;
+    findMany: jest.Mock;
+    count: jest.Mock;
+    update: jest.Mock;
+    updateMany: jest.Mock;
+    delete: jest.Mock;
+  };
+  user: {
+    findUnique: jest.Mock;
+  };
+};
+
 jest.mock("@prisma/client", () => {
-  const mockPrisma = {
+  const mockPrisma: MockPrismaClient = {
     job: {
       findUnique: jest.fn(),
       update: jest.fn(),
@@ -17,22 +36,25 @@ jest.mock("@prisma/client", () => {
       findMany: jest.fn(),
       count: jest.fn(),
       update: jest.fn(),
+      updateMany: jest.fn(),
+      delete: jest.fn(),
     },
     user: {
       findUnique: jest.fn().mockResolvedValue({
         id: "00000000-0000-4000-8000-000000000001",
         role: "CLIENT",
         emailVerified: true,
+        walletAddress: "GDTESTWALLETADDRESS000000000000000000000000000000000000000",
       }),
     },
   };
 
   return {
-    PrismaClient: jest.fn(() => mockPrisma) as any,
+    PrismaClient: jest.fn(() => mockPrisma),
     NotificationType: {
       JOB_APPLIED: "JOB_APPLIED",
       APPLICATION_ACCEPTED: "APPLICATION_ACCEPTED",
-    } as any,
+    },
   };
 });
 
@@ -42,10 +64,22 @@ jest.mock("../../services/notification.service", () => ({
   },
 }));
 
+jest.mock("../../services/recommendation.service", () => ({
+  RecommendationService: {
+    invalidateUserRecommendations: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
+jest.mock("../../lib/token-version", () => ({
+  getCurrentTokenVersion: jest.fn().mockResolvedValue(null),
+  invalidateTokenVersionCache: jest.fn().mockResolvedValue(undefined),
+}));
+
 import { PrismaClient } from "@prisma/client";
-const prismaMock = new PrismaClient() as any;
+const prismaMock = new PrismaClient() as unknown as MockPrismaClient;
 const jobMock = prismaMock.job;
 const applicationMock = prismaMock.application;
+const userMock = prismaMock.user;
 
 // ─── App setup ────────────────────────────────────────────────────────────────
 const app = express();
@@ -207,6 +241,139 @@ describe("POST /api/jobs/:jobId/apply", () => {
 
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: "Job is not accepting applications." });
+  });
+});
+
+// ─── Wallet verification on POST /apply (#801) ────────────────────────────────
+describe("POST /api/jobs/:jobId/apply — wallet verification (#801)", () => {
+  const FREELANCER_ID = "00000000-0000-4000-8000-000000000300";
+  const VALID_BODY = {
+    jobId: JOB_ID,
+    proposal:
+      "I am highly experienced and would love to work on this project. This proposal meets the minimum length requirement.",
+    estimatedDuration: 14,
+    bidAmount: 500,
+  };
+
+  it("returns 422 WalletRequired when freelancer has no wallet connected", async () => {
+    // auth middleware: role/emailVerified check
+    userMock.findUnique.mockResolvedValueOnce({ role: "FREELANCER", emailVerified: true });
+    // wallet check in route handler
+    userMock.findUnique.mockResolvedValueOnce({ walletAddress: null });
+
+    const res = await request(app)
+      .post(`/api/jobs/${JOB_ID}/apply`)
+      .set(authHeader(FREELANCER_ID))
+      .send(VALID_BODY);
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("WalletRequired");
+    expect(res.body.message).toMatch(/wallet/i);
+    expect(jobMock.findUnique).not.toHaveBeenCalled();
+    expect(applicationMock.create).not.toHaveBeenCalled();
+  });
+
+  it("proceeds past wallet check when freelancer has a wallet connected", async () => {
+    // auth middleware: role/emailVerified check
+    userMock.findUnique.mockResolvedValueOnce({ role: "FREELANCER", emailVerified: true });
+    // wallet check in route handler
+    userMock.findUnique.mockResolvedValueOnce({
+      walletAddress: "GDTEST000000000000000000000000000000000000000000000000000",
+    });
+    jobMock.findUnique.mockResolvedValueOnce(null);
+
+    const res = await request(app)
+      .post(`/api/jobs/${JOB_ID}/apply`)
+      .set(authHeader(FREELANCER_ID))
+      .send(VALID_BODY);
+
+    // Wallet check passed → proceeds to job lookup → 404 (job not found)
+    expect(res.status).toBe(404);
+    expect(res.body.code).toBeUndefined();
+    expect(jobMock.findUnique).toHaveBeenCalled();
+  });
+});
+
+// ─── DELETE /api/applications/:id ─────────────────────────────────────────────
+describe("DELETE /api/applications/:id", () => {
+  const APP_ID = "00000000-0000-4000-8000-000000000200";
+  const FREELANCER_ID = "00000000-0000-4000-8000-000000000300";
+
+  it("returns 401 with no auth token", async () => {
+    const res = await request(app).delete(`/api/applications/${APP_ID}`);
+    expect(res.status).toBe(401);
+  });
+
+  it("returns 404 when application does not exist", async () => {
+    applicationMock.findUnique.mockResolvedValueOnce(null);
+
+    const res = await request(app)
+      .delete(`/api/applications/${APP_ID}`)
+      .set(authHeader(FREELANCER_ID));
+
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: "Application not found." });
+  });
+
+  it("returns 403 when caller is not the applicant", async () => {
+    applicationMock.findUnique.mockResolvedValueOnce({
+      id: APP_ID,
+      freelancerId: FREELANCER_ID,
+      status: "PENDING",
+    });
+
+    const res = await request(app)
+      .delete(`/api/applications/${APP_ID}`)
+      .set(authHeader(CLIENT_A_ID)); // different user
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "Not authorized." });
+  });
+
+  it("freelancer can withdraw a pending application", async () => {
+    applicationMock.findUnique.mockResolvedValueOnce({
+      id: APP_ID,
+      freelancerId: FREELANCER_ID,
+      status: "PENDING",
+    });
+    applicationMock.delete.mockResolvedValueOnce({});
+
+    const res = await request(app)
+      .delete(`/api/applications/${APP_ID}`)
+      .set(authHeader(FREELANCER_ID));
+
+    expect(res.status).toBe(204);
+    expect(applicationMock.delete).toHaveBeenCalledWith({ where: { id: APP_ID } });
+  });
+
+  it("returns 409 when freelancer tries to withdraw an accepted application", async () => {
+    applicationMock.findUnique.mockResolvedValueOnce({
+      id: APP_ID,
+      freelancerId: FREELANCER_ID,
+      status: "ACCEPTED",
+    });
+
+    const res = await request(app)
+      .delete(`/api/applications/${APP_ID}`)
+      .set(authHeader(FREELANCER_ID));
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: "Cannot withdraw an accepted or rejected application." });
+  });
+
+  it("returns 409 when freelancer tries to withdraw a rejected application", async () => {
+    applicationMock.findUnique.mockResolvedValueOnce({
+      id: APP_ID,
+      freelancerId: FREELANCER_ID,
+      status: "REJECTED",
+    });
+
+    const res = await request(app)
+      .delete(`/api/applications/${APP_ID}`)
+      .set(authHeader(FREELANCER_ID));
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: "Cannot withdraw an accepted or rejected application." });
   });
 });
 

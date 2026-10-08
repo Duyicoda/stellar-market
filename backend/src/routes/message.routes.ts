@@ -6,12 +6,19 @@ import { asyncHandler } from "../middleware/error";
 import { NotificationService } from "../services/notification.service";
 import { logger } from "../lib/logger";
 import {
+  MessageValidationError,
+  validateMessageSendAuthorization,
+} from "../utils/messageValidation";
+import {
   createMessageSchema,
   updateMessageSchema,
   getMessagesQuerySchema,
   getMessageByIdParamSchema,
   markMessageAsReadSchema,
+  paginationSchema,
 } from "../schemas";
+
+import { buildConversationSummaries } from "../utils/conversations";
 
 const router = Router();
 /**
@@ -74,6 +81,20 @@ router.post(
   asyncHandler(async (req: AuthRequest, res: Response) => {
     const { receiverId, jobId, content } = req.body;
 
+    try {
+      await validateMessageSendAuthorization({
+        senderId: req.userId!,
+        receiverId,
+        jobId,
+        prismaClient: prisma,
+      });
+    } catch (error) {
+      if (error instanceof MessageValidationError) {
+        return res.status(error.status).json({ error: error.message });
+      }
+      throw error;
+    }
+
     const message = await prisma.message.create({
       data: {
         senderId: req.userId!,
@@ -100,109 +121,126 @@ router.post(
   }),
 );
 
-// Get unread message count for the current user (used by Navbar badge)
-router.get("/unread-count", authenticate, async (req: AuthRequest, res: Response) => {
-  try {
-    const count = await prisma.message.count({
-      where: {
-        receiverId: req.userId!,
-        read: false,
-      },
-    });
-
-    res.json({ count });
-  } catch (error) {
-    logger.error({ err: error }, "Unread count error");
-    res.status(500).json({ error: "Internal server error." });
-  }
-});
 
 // Get list of conversations for the current user (distinct partners) — used by Socket-based chat UI
-router.get("/conversations", authenticate, async (req: AuthRequest, res: Response) => {
-  try {
-    const userId = req.userId!;
+router.get(
+  "/conversations",
+  authenticate,
+  validate({ query: paginationSchema }),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const page = Number(req.query.page) || 1;
+      const limit = Number(req.query.limit) || 10;
+      const skip = (page - 1) * limit;
 
-    const messages = await prisma.message.findMany({
-      where: {
-        OR: [{ senderId: userId }, { receiverId: userId }],
-      },
-      include: {
-        sender: { select: { id: true, username: true, avatarUrl: true } },
-        receiver: { select: { id: true, username: true, avatarUrl: true } },
-      },
-      orderBy: { createdAt: "desc" },
-    });
+      const messages = await prisma.message.findMany({
+        where: {
+          OR: [{ senderId: userId }, { receiverId: userId }],
+        },
+        include: {
+          sender: { select: { id: true, username: true, avatarUrl: true } },
+          receiver: { select: { id: true, username: true, avatarUrl: true } },
+        },
+        orderBy: { createdAt: "desc" },
+      });
 
-    const conversationMap = new Map<
-      string,
-      {
-        partner: { id: string; username: string; avatarUrl: string | null };
-        lastMessage: (typeof messages)[number];
-        unreadCount: number;
-      }
-    >();
+      // Grouped by partner only: one entry per user, merged across jobs.
+      const allConversations = buildConversationSummaries(messages, userId, {
+        groupBy: "partner",
+      }).map(({ otherUser, lastMessage, unreadCount }) => ({
+        partner: otherUser,
+        lastMessage,
+        unreadCount,
+      }));
+      const total = allConversations.length;
+      const conversations = allConversations.slice(skip, skip + limit);
+      const hasNext = skip + limit < total;
 
-    for (const msg of messages) {
-      const partner = msg.senderId === userId ? msg.receiver : msg.sender;
-      const partnerId = partner.id;
-
-      if (!conversationMap.has(partnerId)) {
-        conversationMap.set(partnerId, {
-          partner,
-          lastMessage: msg,
-          unreadCount: 0,
-        });
-      }
-
-      if (msg.senderId === partnerId && !msg.read) {
-        const convo = conversationMap.get(partnerId)!;
-        convo.unreadCount += 1;
-      }
+      res.json({
+        data: conversations,
+        pagination: {
+          page,
+          limit,
+          total,
+          hasNext,
+        },
+      });
+    } catch (error) {
+      logger.error({ err: error }, "Conversations error");
+      res.status(500).json({ error: "Internal server error." });
     }
-
-    const conversations = Array.from(conversationMap.values());
-    res.json(conversations);
-  } catch (error) {
-    logger.error({ err: error }, "Conversations error");
-    res.status(500).json({ error: "Internal server error." });
   }
-});
+);
 
 // Get conversation list OR conversation history (if jobId and participantId are provided)
 router.get("/",
   authenticate,
-  validate({ query: getMessagesQuerySchema }),
+  validate({ query: getMessagesQuerySchema.merge(paginationSchema) }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
     const jobId = req.query.jobId as string | undefined;
+    const senderId = req.query.senderId as string | undefined;
+    const receiverId = req.query.receiverId as string | undefined;
     const participantId = req.query.participantId as string | undefined;
+    const messageFilters = [
+      ...(senderId ? [{ senderId }] : []),
+      ...(receiverId ? [{ receiverId }] : []),
+    ];
+    const page = Number(req.query.page) || 1;
+    const limit = Number(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
 
     if (participantId) {
-      const messages = await prisma.message.findMany({
-        where: {
-          AND: [
-            jobId ? { jobId: jobId as string } : {},
-            {
-              OR: [
-                { senderId: req.userId!, receiverId: participantId as string },
-                { senderId: participantId as string, receiverId: req.userId! },
-              ],
-            },
-          ],
+      const where = {
+        AND: [
+          jobId ? { jobId: jobId as string } : {},
+          {
+            OR: [
+              { senderId: req.userId!, receiverId: participantId as string },
+              { senderId: participantId as string, receiverId: req.userId! },
+            ],
+          },
+          ...messageFilters,
+        ],
+      };
+
+      const [messages, total] = await Promise.all([
+        prisma.message.findMany({
+          where,
+          include: {
+            sender: { select: { id: true, username: true, avatarUrl: true } },
+          },
+          orderBy: { createdAt: "asc" },
+          skip,
+          take: limit,
+        }),
+        prisma.message.count({ where }),
+      ]);
+
+      const hasNext = skip + limit < total;
+
+      res.json({
+        data: messages,
+        pagination: {
+          page,
+          limit,
+          total,
+          hasNext,
         },
-        include: {
-          sender: { select: { id: true, username: true, avatarUrl: true } },
-        },
-        orderBy: { createdAt: "asc" },
       });
-      res.json(messages);
       return;
     }
 
     // Fetch all messages involving the user to construct conversation list
+    const userMessagesWhere = {
+      OR: [{ senderId: req.userId! }, { receiverId: req.userId! }],
+    };
+    const where =
+      messageFilters.length > 0
+        ? { AND: [userMessagesWhere, ...messageFilters] }
+        : userMessagesWhere;
     const allMessages = await prisma.message.findMany({
-      where: {
-        OR: [{ senderId: req.userId! }, { receiverId: req.userId! }],
-      },
+      where,
       include: {
         sender: { select: { id: true, username: true, avatarUrl: true } },
         receiver: { select: { id: true, username: true, avatarUrl: true } },
@@ -211,28 +249,24 @@ router.get("/",
       orderBy: { createdAt: "desc" },
     });
 
-    const conversationsMap = new Map();
-
-    allMessages.forEach((msg: any) => {
-      const otherUser = msg.senderId === req.userId ? msg.receiver : msg.sender;
-      const key = `${otherUser.id}-${msg.jobId || "no-job"}`;
-
-      if (!conversationsMap.has(key)) {
-        conversationsMap.set(key, {
-          id: key,
-          otherUser,
-          job: msg.job,
-          lastMessage: msg,
-          unreadCount: 0,
-        });
-      }
-
-      if (msg.receiverId === req.userId && !msg.read) {
-        conversationsMap.get(key).unreadCount++;
-      }
+    // Grouped by partner AND job: the same partner appears once per job
+    // (plus once for job-less messages), so the UI can show per-job threads.
+    const allConversations = buildConversationSummaries(allMessages, req.userId!, {
+      groupBy: "partner-and-job",
     });
+    const total = allConversations.length;
+    const conversations = allConversations.slice(skip, skip + limit);
+    const hasNext = skip + limit < total;
 
-    res.json(Array.from(conversationsMap.values()));
+    res.json({
+      data: conversations,
+      pagination: {
+        page,
+        limit,
+        total,
+        hasNext,
+      },
+    });
   })
 );
 
@@ -257,29 +291,39 @@ router.get(
   authenticate,
   validate({
     params: getMessageByIdParamSchema,
-    query: getMessagesQuerySchema.pick({ jobId: true })
+    query: getMessagesQuerySchema.pick({ jobId: true }).merge(paginationSchema)
   }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
     const otherUserId = req.params.id as string;
     const jobId = req.query.jobId as string | undefined;
+    const page = Number(req.query.page) || 1;
+    const limit = Number(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
 
-    const messages = await prisma.message.findMany({
-      where: {
-        AND: [
-          jobId ? { jobId: jobId as string } : {},
-          {
-            OR: [
-              { senderId: req.userId!, receiverId: otherUserId },
-              { senderId: otherUserId, receiverId: req.userId! },
-            ],
-          },
-        ],
-      },
-      include: {
-        sender: { select: { id: true, username: true, avatarUrl: true } },
-      },
-      orderBy: { createdAt: "asc" },
-    });
+    const where = {
+      AND: [
+        jobId ? { jobId: jobId as string } : {},
+        {
+          OR: [
+            { senderId: req.userId!, receiverId: otherUserId },
+            { senderId: otherUserId, receiverId: req.userId! },
+          ],
+        },
+      ],
+    };
+
+    const [messages, total] = await Promise.all([
+      prisma.message.findMany({
+        where,
+        include: {
+          sender: { select: { id: true, username: true, avatarUrl: true } },
+        },
+        orderBy: { createdAt: "asc" },
+        skip,
+        take: limit,
+      }),
+      prisma.message.count({ where }),
+    ]);
 
     // Mark messages as read
     await prisma.message.updateMany({
@@ -292,7 +336,17 @@ router.get(
       data: { read: true },
     });
 
-    res.json(messages);
+    const hasNext = skip + limit < total;
+
+    res.json({
+      data: messages,
+      pagination: {
+        page,
+        limit,
+        total,
+        hasNext,
+      },
+    });
   }),
 );
 
@@ -308,11 +362,21 @@ router.put(
     const id = req.params.id as string;
     const { isRead } = req.body;
 
+    const message = await prisma.message.findUnique({
+      where: { id },
+    });
+
+    if (!message) {
+      return res.status(404).json({ error: "Message not found." });
+    }
+    if (message.receiverId !== req.userId) {
+      return res
+        .status(403)
+        .json({ error: "Not authorized to mark this message as read." });
+    }
+
     await prisma.message.update({
-      where: {
-        id,
-        receiverId: req.userId!,
-      },
+      where: { id },
       data: { read: isRead },
     });
     res.status(204).send();

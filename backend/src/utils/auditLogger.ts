@@ -1,10 +1,18 @@
-import { PrismaClient } from "@prisma/client";
-import { logger } from "../lib/logger";
-
-const prisma = new PrismaClient();
+import { AuditService } from "../services/audit.service";
 
 /**
- * Utility to log administrative actions for audit purposes.
+ * Audit logging entry points.
+ *
+ * Both helpers below are thin, backward-compatible wrappers over the single
+ * unified, hash-chained audit trail (see services/audit.service.ts, issue #875).
+ * Their signatures are unchanged so every existing call site keeps working; the
+ * difference is that entries are now durably queued and guaranteed to be
+ * persisted (via the outbox worker) rather than written best-effort — or, in the
+ * security-event case, not persisted at all.
+ */
+
+/**
+ * Log an administrative action (suspend user, delete job, override dispute, …).
  *
  * @param adminId - The ID of the admin performing the action
  * @param action - The name of the action (e.g., "SUSPEND_USER")
@@ -15,46 +23,39 @@ export const logAdminAction = async (
   adminId: string,
   action: string,
   target: string,
-  metadata?: any,
-) => {
-  try {
-    await prisma.auditLog.create({
-      data: {
-        adminId,
-        action,
-        target,
-        metadata: metadata ? JSON.parse(JSON.stringify(metadata)) : undefined,
-      },
-    });
-  } catch (error) {
-    logger.error({ err: error }, "Failed to create audit log");
-    // We don't throw here to avoid failing the main request if logging fails,
-    // though in a production system we might want stricter guarantees.
-  }
+  metadata?: unknown,
+): Promise<void> => {
+  await AuditService.record({
+    category: "ADMIN_ACTION",
+    action,
+    actorId: adminId,
+    target,
+    metadata,
+  });
 };
 
 /**
- * Generic audit logger for system events (virus scanning, etc.)
+ * Generic audit logger for security-relevant system events (virus scanning,
+ * blocked uploads, etc.). Previously this only logged to pino and never
+ * persisted; it now goes through the same durable, hash-chained mechanism.
  */
 interface AuditLogEntry {
   action: string;
   userId: string;
-  details: any;
+  details: unknown;
   ipAddress: string;
 }
 
 export const auditLogger = {
-  log: (entry: AuditLogEntry) => {
-    // Log to structured logger for now
-    // In production, this could write to a dedicated audit table
-    logger.info(
-      {
-        auditAction: entry.action,
-        userId: entry.userId,
-        details: entry.details,
-        ipAddress: entry.ipAddress,
-      },
-      `Audit: ${entry.action}`,
-    );
+  log: (entry: AuditLogEntry): void => {
+    // Fire-and-forget: enqueue is non-blocking and never throws for a DB issue,
+    // so security-event call sites (which do not await) stay unaffected.
+    void AuditService.record({
+      category: "SECURITY_EVENT",
+      action: entry.action,
+      actorId: entry.userId,
+      metadata: entry.details,
+      ipAddress: entry.ipAddress,
+    });
   },
 };

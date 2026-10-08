@@ -1,13 +1,8 @@
 import nodemailer from "nodemailer";
+import jwt from "jsonwebtoken";
 import { config } from "../config";
 import { logger } from "../lib/logger";
-import { renderPasswordResetEmail } from "../templates/email/password-reset";
-import { renderVerificationEmail } from "../templates/email/verification";
-import { renderDisputeOpenedEmail } from "../templates/email/dispute-opened";
-import { renderDisputeResolvedEmail } from "../templates/email/dispute-resolved";
-import { renderMilestoneApprovedEmail } from "../templates/email/milestone-approved";
-import { renderPaymentReleasedEmail } from "../templates/email/payment-released";
-import { renderApplicationAcceptedEmail } from "../templates/email/application-accepted";
+import { renderEmailTemplate } from "../utils/emailTemplateRenderer";
 
 const transporter = nodemailer.createTransport({
   host: config.smtp.host,
@@ -19,13 +14,62 @@ const transporter = nodemailer.createTransport({
   },
 });
 
+/** Sends via Brevo's transactional email HTTP API — auth is just the API key, no SMTP login. */
+async function sendViaBrevo(params: { to: string; subject: string; html: string }): Promise<void> {
+  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      "api-key": config.email.apiKey,
+    },
+    body: JSON.stringify({
+      sender: { name: config.email.fromName, email: config.email.fromAddress },
+      to: [{ email: params.to }],
+      subject: params.subject,
+      htmlContent: params.html,
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`Brevo API error (${response.status}): ${body}`);
+  }
+}
+
 export class EmailService {
+  static generateUnsubscribeToken(userId: string): string {
+    return jwt.sign(
+      { userId, type: "unsubscribe" },
+      config.jwtSecret,
+      { expiresIn: "90d" },
+    );
+  }
+
+  static buildUnsubscribeUrl(userId: string): string {
+    const token = this.generateUnsubscribeToken(userId);
+    return `${config.frontendUrl}/api/v1/unsubscribe?token=${token}`;
+  }
+
   static async sendVerificationEmail(to: string, token: string): Promise<void> {
     const verifyUrl = `${config.frontendUrl}/auth/verify-email?token=${token}`;
+    
+    // Render the email body
+    const bodyHtml = renderEmailTemplate("verification", { verifyUrl });
+    
+    // Render the full layout
+    const html = renderEmailTemplate("layout", {
+      title: "Verify your email",
+      preheader: "Confirm your email address to finish setting up your account.",
+      bodyHtml,
+      actionUrl: verifyUrl,
+      actionLabel: "Verify email",
+    });
+    
     await this.sendHtml({
       to,
       subject: "Verify Your Email - StellarMarket",
-      html: renderVerificationEmail({ verifyUrl }),
+      html,
     });
   }
 
@@ -34,10 +78,23 @@ export class EmailService {
     token: string,
   ): Promise<void> {
     const resetUrl = `${config.frontendUrl}/auth/reset-password?token=${token}`;
+    
+    // Render the email body
+    const bodyHtml = renderEmailTemplate("password-reset", { resetUrl });
+    
+    // Render the full layout
+    const html = renderEmailTemplate("layout", {
+      title: "Reset your password",
+      preheader: "Use this link to reset your StellarMarket password.",
+      bodyHtml,
+      actionUrl: resetUrl,
+      actionLabel: "Reset password",
+    });
+    
     await this.sendHtml({
       to,
       subject: "Reset Your Password - StellarMarket",
-      html: renderPasswordResetEmail({ resetUrl }),
+      html,
     });
   }
 
@@ -48,33 +105,72 @@ export class EmailService {
       | "dispute.resolved"
       | "milestone.approved"
       | "payment.released"
-      | "application.accepted";
+      | "application.accepted"
+      | "suspicious-reporter.flagged";
     title: string;
     message: string;
     outcome?: string;
     actionUrl?: string;
+    unsubscribeUrl?: string;
   }): Promise<void> {
-    const { to, event, title, message, outcome, actionUrl } = params;
+    const { to, event, title, message, outcome, actionUrl, unsubscribeUrl } = params;
 
-    const html = (() => {
-      switch (event) {
-        case "dispute.opened":
-          return renderDisputeOpenedEmail({ title, message, actionUrl });
-        case "dispute.resolved":
-          return renderDisputeResolvedEmail({
-            title,
-            message,
-            outcome,
-            actionUrl,
-          });
-        case "milestone.approved":
-          return renderMilestoneApprovedEmail({ title, message, actionUrl });
-        case "payment.released":
-          return renderPaymentReleasedEmail({ title, message, actionUrl });
-        case "application.accepted":
-          return renderApplicationAcceptedEmail({ title, message, actionUrl });
+    let bodyHtml: string;
+    let preheader: string;
+    let actionLabel: string | undefined;
+
+    switch (event) {
+      case "dispute.opened":
+        bodyHtml = renderEmailTemplate("dispute-opened", { message, actionUrl });
+        preheader = "A dispute was opened on your job.";
+        actionLabel = actionUrl ? "View dispute" : undefined;
+        break;
+      case "dispute.resolved": {
+        const outcomeText =
+          outcome === "CLIENT"
+            ? "The dispute was resolved in favor of the client."
+            : outcome === "FREELANCER"
+              ? "The dispute was resolved in favor of the freelancer."
+              : "The dispute has been resolved.";
+        bodyHtml = renderEmailTemplate("dispute-resolved", {
+          message,
+          outcomeText,
+          actionUrl,
+        });
+        preheader = "Your dispute has been resolved.";
+        actionLabel = actionUrl ? "View job details" : undefined;
+        break;
       }
-    })();
+      case "milestone.approved":
+        bodyHtml = renderEmailTemplate("milestone-approved", { message, actionUrl });
+        preheader = "A milestone was approved.";
+        actionLabel = actionUrl ? "View job" : undefined;
+        break;
+      case "payment.released":
+        bodyHtml = renderEmailTemplate("payment-released", { message, actionUrl });
+        preheader = "A payment was released to you.";
+        actionLabel = actionUrl ? "View details" : undefined;
+        break;
+      case "application.accepted":
+        bodyHtml = renderEmailTemplate("application-accepted", { message, actionUrl });
+        preheader = "Your application was accepted.";
+        actionLabel = actionUrl ? "Open StellarMarket" : undefined;
+        break;
+      case "suspicious-reporter.flagged":
+        bodyHtml = renderEmailTemplate("suspicious-reporter-flagged", { message, actionUrl });
+        preheader = "A user has been flagged as a suspicious reporter.";
+        actionLabel = actionUrl ? "View details" : undefined;
+        break;
+    }
+
+    const html = renderEmailTemplate("layout", {
+      title,
+      preheader,
+      bodyHtml,
+      actionUrl,
+      actionLabel,
+      unsubscribeUrl,
+    });
 
     const subjectPrefix = "StellarMarket";
     await this.sendHtml({
@@ -90,12 +186,16 @@ export class EmailService {
     html: string;
   }): Promise<void> {
     try {
-      await transporter.sendMail({
-        from: config.smtp.from,
-        to: params.to,
-        subject: params.subject,
-        html: params.html,
-      });
+      if (config.email.provider === "brevo") {
+        await sendViaBrevo(params);
+      } else {
+        await transporter.sendMail({
+          from: config.smtp.from,
+          to: params.to,
+          subject: params.subject,
+          html: params.html,
+        });
+      }
     } catch (error) {
       logger.error(
         { err: error, to: params.to, subject: params.subject },

@@ -59,24 +59,29 @@ jest.mock("../../lib/logger", () => ({
 }));
 
 jest.mock("../../middleware/auth", () => ({
-  authenticate: (req: any, _res: any, next: any) => {
+  authenticate: (req: AuthRequest, _res: Response, next: NextFunction) => {
     req.userId = "reporter-user-id";
     next();
   },
 }));
 
 jest.mock("../../middleware/validation", () => ({
-  validate: () => (_req: any, _res: any, next: any) => next(),
+  validate:
+    () => (_req: Request, _res: Response, next: NextFunction) =>
+      next(),
 }));
 
 // Bypass express-rate-limit in tests
 jest.mock("express-rate-limit", () =>
-  jest.fn().mockReturnValue((_req: any, _res: any, next: any) => next())
+  jest
+    .fn()
+    .mockReturnValue((_req: Request, _res: Response, next: NextFunction) => next())
 );
 
 import request from "supertest";
-import express from "express";
+import express, { Request, Response, NextFunction } from "express";
 import reportRoutes from "../report.routes";
+import type { AuthRequest } from "../../middleware/auth";
 
 const app = express();
 app.use(express.json());

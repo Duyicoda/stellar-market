@@ -17,6 +17,37 @@ import {
 } from "@stellar/freighter-api";
 import { rpc, Transaction, Horizon } from "@stellar/stellar-sdk";
 import { Loader2, QrCode, Wallet, Smartphone } from "lucide-react";
+import { useToast } from "@/components/Toast";
+import { refreshAccessToken } from "@/lib/authToken";
+
+export class FreighterTimeoutError extends Error {
+  constructor() {
+    super("Wallet connection timed out. Make sure Freighter is unlocked and try again.");
+    this.name = "FreighterTimeoutError";
+  }
+}
+
+async function getPublicKey(): Promise<string> {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const api = require("@stellar/freighter-api");
+  if (api.getPublicKey) {
+    const res = await api.getPublicKey();
+    if (typeof res === "string") return res;
+    if (res && res.address) return res.address;
+    if (res && res.error) throw new Error(res.error);
+    return res;
+  }
+  
+  const result = await getAddress();
+  if (result.error) {
+    throw new Error(
+      typeof result.error === "string"
+        ? result.error
+        : (result.error as any).message || "Failed to retrieve address"
+    );
+  }
+  return result.address;
+}
 
 interface WalletBalance {
   asset: string;
@@ -30,6 +61,19 @@ interface WalletSession {
 }
 
 type WalletProviderType = "freighter" | "walletconnect" | "lobstr";
+
+export type TxResolutionStatus =
+  | "PENDING"
+  | "SUCCESS"
+  | "FAILED"
+  | "EXPIRED"
+  | "STALE_SESSION";
+
+export interface TxTrackingMeta {
+  type: "DEPOSIT" | "RELEASE" | "REFUND" | "DISPUTE_PAYOUT";
+  jobId?: string;
+  milestoneId?: string;
+}
 
 interface WalletState {
   address: string | null;
@@ -45,12 +89,46 @@ interface WalletState {
   disconnect: () => void;
   refreshBalance: () => Promise<void>;
   signMessage: (message: string) => Promise<string>;
+  /**
+   * Signs and broadcasts a Soroban transaction.
+   *
+   * When `meta` is supplied, the transaction is pre-registered with the
+   * backend (`POST /transactions/pre-register`) and its terminal state is
+   * resolved by polling the backend's `GET /transactions/:hash/status`
+   * endpoint — the same DB-tracked source of truth used to detect ledger
+   * expiry — instead of raw RPC polling. This is what allows `status` and
+   * `canRetry` to be populated so callers can distinguish a transaction that
+   * has permanently expired (safe to rebuild with a fresh sequence number and
+   * resubmit) from one that is merely slow. Callers that omit `meta` keep the
+   * legacy RPC-only polling behavior (no `status`/`canRetry`).
+   *
+   * If the wallet account, connection, or network changes while a transaction
+   * is in flight, the result is `STALE_SESSION`. Callers must not confirm the
+   * transaction or perform any follow-up mutation from that stale result.
+   */
   signAndBroadcastTransaction: (
-    xdr: string
-  ) => Promise<{ hash: string; success: boolean; error?: string; resultXdr?: string }>;
+    xdr: string,
+    meta?: TxTrackingMeta
+  ) => Promise<{
+    hash: string;
+    success: boolean;
+    error?: string;
+    resultXdr?: string;
+    status?: TxResolutionStatus;
+    canRetry?: boolean;
+  }>;
+  /**
+   * Bind the currently-connected wallet address to the authenticated account
+   * by completing a server-issued challenge / ed25519 signature round-trip.
+   * Calls POST /auth/wallet/challenge, signs with Freighter/LOBSTR signMessage,
+   * then calls POST /auth/wallet/verify. On success, updates the stored JWT
+   * and returns { success: true, token }.
+   */
+  bindWallet: (authToken: string) => Promise<{ success: boolean; token?: string; error?: string }>;
   isSessionActive: boolean;
   sessionExpiresIn: number | null;
   extendSession: () => void;
+  isReconnecting: boolean;
 }
 
 const WalletContext = createContext<WalletState | undefined>(undefined);
@@ -58,6 +136,7 @@ const WalletContext = createContext<WalletState | undefined>(undefined);
 const STORAGE_KEY = "stellarmarket_wallet_connected";
 const WALLET_TYPE_KEY = "stellarmarket_wallet_type";
 const SESSION_KEY = "stellarmarket_wallet_session";
+const FREIGHTER_WALLET_KEY = "stellar_wallet";
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
 const SESSION_WARNING_MS = 5 * 60 * 1000;
 
@@ -69,11 +148,15 @@ export { truncateAddress };
 
 const HORIZON_URL = "https://horizon-testnet.stellar.org";
 const horizonServer = new Horizon.Server(HORIZON_URL);
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5000/api/v1";
+const STATUS_POLL_INTERVAL_MS = 3000;
+const STATUS_POLL_MAX_ATTEMPTS = 40; // ~2 minutes
 
 const TESTNET_PASSPHRASE = "Test SDF Network ; September 2015";
 const MAINNET_PASSPHRASE = "Public Global Stellar Network ; September 2015";
 
 export function WalletProvider({ children }: { children: React.ReactNode }) {
+  const { toast } = useToast();
   const [address, setAddress] = useState<string | null>(null);
   const [isConnecting, setIsConnecting] = useState(false);
   const [isFreighterInstalled, setIsFreighterInstalled] = useState<boolean | null>(null);
@@ -83,13 +166,24 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   const [balances, setBalances] = useState<WalletBalance[]>([]);
   const [isLoadingBalance, setIsLoadingBalance] = useState(false);
   const [walletType, setWalletType] = useState<WalletProviderType | null>(null);
+  // Which provider the current "not installed" error is actually about — set
+  // explicitly at the point of failure. walletType only gets set on a
+  // *successful* connect, so relying on it (or on isFreighterInstalled alone)
+  // to pick the error message meant the modal could show "LOBSTR not
+  // installed" for a failed Freighter attempt whenever walletType happened to
+  // be stale from an earlier attempt.
+  const [notInstalledProvider, setNotInstalledProvider] = useState<"freighter" | "lobstr" | null>(null);
   const [showWalletSelect, setShowWalletSelect] = useState(false);
   const [showDisconnectConfirm, setShowDisconnectConfirm] = useState(false);
   const pendingConnectResolve = useRef<((address: string | null) => void) | null>(null);
   const pendingDisconnectResolve = useRef<((value: string | null) => void) | null>(null);
   const switchingToProvider = useRef<WalletProviderType | null>(null);
+  const walletSessionEpoch = useRef(0);
 
-  const balanceRefreshInterval = useRef<NodeJS.Timeout | null>(null);
+  const invalidateWalletSession = useCallback(() => {
+    walletSessionEpoch.current += 1;
+  }, []);
+
   const sessionTimeoutId = useRef<NodeJS.Timeout | null>(null);
   const sessionWarningId = useRef<NodeJS.Timeout | null>(null);
   const sessionCheckInterval = useRef<NodeJS.Timeout | null>(null);
@@ -129,6 +223,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
 
   const [isSessionActive, setIsSessionActive] = useState(false);
   const [sessionExpiresIn, setSessionExpiresIn] = useState<number | null>(null);
+  const [isReconnecting, setIsReconnecting] = useState(false);
 
   // Session management functions
   const getStoredSession = useCallback((): WalletSession | null => {
@@ -292,19 +387,55 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     if (sessionAge > SESSION_TIMEOUT_MS) {
       clearSession();
       localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(FREIGHTER_WALLET_KEY);
       return;
     }
 
     const installed = await checkFreighterInstalled();
-    if (!installed) return;
+    if (!installed) {
+      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(FREIGHTER_WALLET_KEY);
+      clearSession();
+      return;
+    }
 
+    setIsReconnecting(true);
     try {
+      const connectedResult = await freighterIsConnected();
+      if (connectedResult.error || !connectedResult.isConnected) {
+        localStorage.removeItem(STORAGE_KEY);
+        localStorage.removeItem(WALLET_TYPE_KEY);
+        localStorage.removeItem(FREIGHTER_WALLET_KEY);
+        clearSession();
+        return;
+      }
+
       const result = await getAddress();
       if (result.error) {
         localStorage.removeItem(STORAGE_KEY);
         localStorage.removeItem(WALLET_TYPE_KEY);
+        localStorage.removeItem(FREIGHTER_WALLET_KEY);
+        clearSession();
         return;
       }
+
+      const storedFreighterWallet = (() => {
+        try {
+          const raw = localStorage.getItem(FREIGHTER_WALLET_KEY);
+          return raw ? (JSON.parse(raw) as { walletAddress: string; connectedAt: number }) : null;
+        } catch {
+          return null;
+        }
+      })();
+
+      if (storedFreighterWallet && storedFreighterWallet.walletAddress !== result.address) {
+        localStorage.removeItem(STORAGE_KEY);
+        localStorage.removeItem(WALLET_TYPE_KEY);
+        localStorage.removeItem(FREIGHTER_WALLET_KEY);
+        clearSession();
+        return;
+      }
+
       setAddress(result.address);
       setWalletType("freighter");
       saveSession(result.address);
@@ -312,6 +443,10 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     } catch {
       localStorage.removeItem(STORAGE_KEY);
       localStorage.removeItem(WALLET_TYPE_KEY);
+      localStorage.removeItem(FREIGHTER_WALLET_KEY);
+      clearSession();
+    } finally {
+      setIsReconnecting(false);
     }
   }, [checkFreighterInstalled, getWalletKit, getStoredSession, clearSession, saveSession, updateSessionActivity]);
 
@@ -319,25 +454,24 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     restoreSession();
   }, [restoreSession]);
 
-  // Fetch balance when address changes
+  // Fetch balance when the connected address changes. We intentionally avoid a
+  // fixed polling interval here (which fired even when the tab was idle and was
+  // the source of redundant Horizon calls); the header balance is kept fresh by
+  // the cached useWalletBalance hook (30s stale-time + refetch-on-focus), and
+  // other consumers refresh explicitly via refreshBalance after transactions.
   useEffect(() => {
     if (address) {
       refreshBalance();
-      balanceRefreshInterval.current = setInterval(refreshBalance, 30000);
     } else {
       setBalance(null);
       setBalances([]);
     }
-    return () => {
-      if (balanceRefreshInterval.current) {
-        clearInterval(balanceRefreshInterval.current);
-      }
-    };
   }, [address, refreshBalance]);
 
   // Listen for Freighter account changes
   useEffect(() => {
     const handleAccountChanged = async () => {
+      invalidateWalletSession();
       try {
         const result = await getAddress();
         if (result.error) {
@@ -360,7 +494,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     return () => {
       window.removeEventListener("freighter#accountChanged", handleAccountChanged);
     };
-  }, [clearSession, updateSessionActivity]);
+  }, [clearSession, invalidateWalletSession, updateSessionActivity]);
 
   // Listen for wallet disconnect events
   useEffect(() => {
@@ -369,6 +503,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       try {
         const result = await freighterIsConnected();
         if (result.error || !result.isConnected) {
+          invalidateWalletSession();
           setAddress(null);
           setError(null);
           setBalance(null);
@@ -378,6 +513,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
           window.dispatchEvent(new CustomEvent("stellarmarket:walletDisconnected"));
         }
       } catch {
+        invalidateWalletSession();
         setAddress(null);
         setError(null);
         setBalance(null);
@@ -402,58 +538,86 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       window.removeEventListener("freighter#disconnected", handleDisconnect);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [address, walletType, clearSession]);
+  }, [address, walletType, clearSession, invalidateWalletSession]);
+
+  // A network switch invalidates transaction results even when the account
+  // remains the same. Freighter dispatches this event before React state can
+  // update, so the ref protects in-flight polling synchronously.
+  useEffect(() => {
+    const handleNetworkChanged = () => {
+      invalidateWalletSession();
+    };
+
+    window.addEventListener("freighter#networkChanged", handleNetworkChanged);
+    return () => {
+      window.removeEventListener("freighter#networkChanged", handleNetworkChanged);
+    };
+  }, [invalidateWalletSession]);
 
   const connectFreighter = useCallback(async () => {
     setError(null);
+    setNotInstalledProvider(null);
     setIsConnecting(true);
     try {
-      if (
-        typeof window !== "undefined" &&
-        !(window as unknown as Record<string, unknown>).freighter
-      ) {
-        setError("NOT_INSTALLED");
-        return null;
-      }
+      // Freighter no longer injects a raw `window.freighter` global — the
+      // official @stellar/freighter-api's isConnected() below is the correct,
+      // current way to detect it. A stale window.freighter check used to run
+      // here first and would report "not installed" even with a genuinely
+      // installed, working extension, since that global is never set by
+      // current Freighter versions.
       const installed = await checkFreighterInstalled();
       if (!installed) {
+        setNotInstalledProvider("freighter");
         setError("NOT_INSTALLED");
         return null;
       }
-      const accessResult = await requestAccess();
-      if (accessResult.error) {
-        const msg = typeof accessResult.error === "string"
-          ? accessResult.error
-          : ((accessResult.error as { message?: string }).message ?? "");
-        if (msg.toLowerCase().includes("locked") || msg.toLowerCase().includes("unlock")) {
-          setError("LOCKED");
-        } else {
-          setError(msg || "Failed to connect wallet");
+
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new FreighterTimeoutError()), 10000)
+      );
+
+      const pubKeyPromise = (async () => {
+        const accessResult = await requestAccess();
+        if (accessResult.error) {
+          throw new Error(
+            typeof accessResult.error === "string"
+              ? accessResult.error
+              : ((accessResult.error as { message?: string }).message ?? "")
+          );
         }
-        return null;
-      }
-      const addressResult = await getAddress();
-      if (addressResult.error) {
-        const msg = typeof addressResult.error === "string"
-          ? addressResult.error
-          : ((addressResult.error as { message?: string }).message ?? "");
-        setError(msg || "Failed to retrieve address");
-        return null;
-      }
-      setAddress(addressResult.address);
+        return await getPublicKey();
+      })();
+
+      const addressResult = await Promise.race([
+        pubKeyPromise,
+        timeoutPromise,
+      ]);
+
+      setAddress(addressResult);
       setWalletType("freighter");
       localStorage.setItem(STORAGE_KEY, "true");
       localStorage.setItem(WALLET_TYPE_KEY, "freighter");
-      saveSession(addressResult.address);
+      localStorage.setItem(FREIGHTER_WALLET_KEY, JSON.stringify({ walletAddress: addressResult, connectedAt: Date.now() }));
+      saveSession(addressResult);
       updateSessionActivity();
-      return addressResult.address;
-    } catch {
-      setError("An unexpected error occurred while connecting the wallet");
+      return addressResult;
+    } catch (err: unknown) {
+      if (err instanceof FreighterTimeoutError) {
+        setError("TIMEOUT");
+        toast.error("Wallet connection timed out. Make sure Freighter is unlocked and try again.");
+      } else {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (errMsg.toLowerCase().includes("locked") || errMsg.toLowerCase().includes("unlock")) {
+          setError("LOCKED");
+        } else {
+          setError(errMsg || "An unexpected error occurred while connecting the wallet");
+        }
+      }
       return null;
     } finally {
       setIsConnecting(false);
     }
-  }, [checkFreighterInstalled, saveSession, updateSessionActivity]);
+  }, [checkFreighterInstalled, saveSession, updateSessionActivity, toast]);
 
   const connectWalletConnect = useCallback(async () => {
     setError(null);
@@ -482,6 +646,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
 
   const connectLOBSTR = useCallback(async () => {
     setError(null);
+    setNotInstalledProvider(null);
     setIsConnecting(true);
     try {
       const kit = await getWalletKit();
@@ -512,6 +677,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       const msg = err instanceof Error ? err.message : "";
       if (msg.includes("not installed") || msg.includes("not found") || msg.includes("LOBSTR")) {
         setIsLobstrInstalled(false);
+        setNotInstalledProvider("lobstr");
         setError("NOT_INSTALLED");
       } else if (msg.includes("network") || msg.includes("Network")) {
         setError("NETWORK_MISMATCH");
@@ -575,6 +741,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   }, [connectFreighter, connectWalletConnect, connectLOBSTR, handleProviderSwitch, address]);
 
   const disconnect = useCallback(() => {
+    invalidateWalletSession();
     setAddress(null);
     setError(null);
     setBalance(null);
@@ -582,9 +749,33 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     setWalletType(null);
     localStorage.removeItem(STORAGE_KEY);
     localStorage.removeItem(WALLET_TYPE_KEY);
+    localStorage.removeItem(FREIGHTER_WALLET_KEY);
     clearSession();
     window.dispatchEvent(new CustomEvent("stellarmarket:walletDisconnected"));
-  }, [clearSession]);
+  }, [clearSession, invalidateWalletSession]);
+
+  useEffect(() => {
+    const handleAuthLogout = () => {
+      disconnect();
+    };
+
+    const handleStorageChange = (event: StorageEvent) => {
+      if (
+        (event.key === null || event.key === "stellarmarket_jwt" || event.key === SESSION_KEY) &&
+        !event.newValue
+      ) {
+        disconnect();
+      }
+    };
+
+    window.addEventListener("stellarmarket:authLogout", handleAuthLogout);
+    window.addEventListener("storage", handleStorageChange);
+
+    return () => {
+      window.removeEventListener("stellarmarket:authLogout", handleAuthLogout);
+      window.removeEventListener("storage", handleStorageChange);
+    };
+  }, [disconnect]);
 
   const handleDisconnectConfirm = useCallback(async (confirmed: boolean) => {
     setShowDisconnectConfirm(false);
@@ -622,12 +813,87 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     return result.signedMessage ?? result.signature;
   }, [getWalletKit, walletType, address]);
 
-  const signAndBroadcastTransaction = useCallback(async (xdr: string) => {
+  const bindWallet = useCallback(async (authToken: string) => {
+    if (!address) {
+      return { success: false, error: "No wallet connected. Connect a wallet first." };
+    }
+    const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5000/api/v1";
+
+    // The access token backing `authToken` is short-lived (15m). If it's
+    // already expired by the time the user gets through connecting a wallet
+    // and signing a message, retry once with a freshly refreshed token
+    // instead of failing outright with "Invalid or expired token."
+    let currentToken = authToken;
+    const fetchWithRefresh = async (input: string, init: RequestInit): Promise<Response> => {
+      const withAuth = (token: string): RequestInit => ({
+        ...init,
+        headers: { ...init.headers, Authorization: `Bearer ${token}` },
+      });
+      const response = await fetch(input, withAuth(currentToken));
+      if (response.status !== 401) return response;
+
+      const refreshed = await refreshAccessToken();
+      if (!refreshed) return response;
+      currentToken = refreshed;
+      return fetch(input, withAuth(currentToken));
+    };
+
+    try {
+      // Step 1 — fetch a one-time challenge from the server
+      const challengeRes = await fetchWithRefresh(`${API}/auth/wallet/challenge`, {
+        method: "POST",
+      });
+      if (!challengeRes.ok) {
+        const body = await challengeRes.json().catch(() => ({}));
+        return { success: false, error: body.error ?? "Failed to fetch challenge" };
+      }
+      const { challenge } = await challengeRes.json() as { challenge: string };
+
+      // Step 2 — sign the challenge with the wallet's private key
+      // Freighter's signMessage signs raw UTF-8 bytes (ed25519).
+      // LOBSTR via StellarWalletsKit also exposes signMessage with the same
+      // semantics.  Both return a base64-encoded ed25519 signature.
+      const signature = await signMessage(challenge);
+
+      // Step 3 — submit address + signature for server-side verification
+      const verifyRes = await fetchWithRefresh(`${API}/auth/wallet/verify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address, signature }),
+      });
+      if (!verifyRes.ok) {
+        const body = await verifyRes.json().catch(() => ({}));
+        return { success: false, error: body.error ?? "Wallet verification failed" };
+      }
+      const { token } = await verifyRes.json() as { token: string };
+      return { success: true, token };
+    } catch (err: unknown) {
+      return {
+        success: false,
+        error: err instanceof Error ? err.message : "Wallet binding failed",
+      };
+    }
+  }, [address, signMessage]);
+
+  const signAndBroadcastTransaction = useCallback(async (xdr: string, meta?: TxTrackingMeta) => {
+    const transactionEpoch = walletSessionEpoch.current;
+    let transactionHash = "";
+    const sessionChanged = () => walletSessionEpoch.current !== transactionEpoch;
+    const staleSessionResult = () => ({
+      success: false as const,
+      hash: transactionHash,
+      status: "STALE_SESSION" as const,
+      canRetry: false,
+      error:
+        "Wallet account, connection, or network changed while the transaction was processing. Review the active wallet before trying again.",
+    });
+
     try {
       let signedResult: any;
 
       if (walletType === "walletconnect" || walletType === "lobstr") {
         const kit = await getWalletKit();
+        if (sessionChanged()) return staleSessionResult();
         signedResult = await kit.signTransaction(xdr, {
           networkPassphrase: TESTNET_PASSPHRASE,
           address,
@@ -638,6 +904,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
         });
       }
 
+      if (sessionChanged()) return staleSessionResult();
       updateSessionActivity();
 
       if (signedResult.error) {
@@ -652,27 +919,120 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       const server = new rpc.Server("https://soroban-testnet.stellar.org");
       const tx = new Transaction(signedTxXdr, TESTNET_PASSPHRASE);
       const sendResponse = await server.sendTransaction(tx);
+      transactionHash = sendResponse.hash;
+      if (sessionChanged()) return staleSessionResult();
 
       if (sendResponse.status !== "PENDING") {
         return { success: false, hash: sendResponse.hash, error: "Transaction submission failed" };
       }
 
-      let attempts = 0;
-      while (attempts <= 10) {
-        const statusResponse = await server.getTransaction(sendResponse.hash);
-        if (statusResponse.status === rpc.Api.GetTransactionStatus.SUCCESS) {
-          const successResponse = statusResponse as rpc.Api.GetSuccessfulTransactionResponse;
-          return { success: true, hash: sendResponse.hash, resultXdr: successResponse.returnValue?.toXDR("base64") };
+      if (!meta) {
+        // Legacy path — raw RPC polling only, preserved for callers that
+        // don't yet track transactions with the backend.
+        let attempts = 0;
+        while (attempts <= 10) {
+          if (sessionChanged()) return staleSessionResult();
+          const statusResponse = await server.getTransaction(sendResponse.hash);
+          if (sessionChanged()) return staleSessionResult();
+          if (statusResponse.status === rpc.Api.GetTransactionStatus.SUCCESS) {
+            const successResponse = statusResponse as rpc.Api.GetSuccessfulTransactionResponse;
+            return { success: true, hash: sendResponse.hash, resultXdr: successResponse.returnValue?.toXDR("base64") };
+          }
+          if (statusResponse.status === rpc.Api.GetTransactionStatus.FAILED) {
+            return { success: false, hash: sendResponse.hash, error: "Transaction failed on-chain" };
+          }
+          attempts++;
+          await new Promise((resolve) => setTimeout(resolve, 2000));
         }
-        if (statusResponse.status === rpc.Api.GetTransactionStatus.FAILED) {
-          return { success: false, hash: sendResponse.hash, error: "Transaction failed on-chain" };
-        }
-        attempts++;
-        await new Promise((resolve) => setTimeout(resolve, 2000));
+        return { success: false, hash: sendResponse.hash, error: "Transaction timed out" };
       }
 
-      return { success: false, hash: sendResponse.hash, error: "Transaction timed out" };
+      // Tracked path — pre-register with the backend, then let the backend's
+      // DB-tracked status endpoint (the same one that detects ledger expiry)
+      // be the single source of truth for the terminal state, instead of
+      // maintaining a second, independent RPC-only status vocabulary here.
+      const maxTime = tx.timeBounds?.maxTime;
+      const maxLedger = maxTime ? parseInt(String(maxTime), 10) : undefined;
+      const token = localStorage.getItem("token") ?? localStorage.getItem("stellarmarket_jwt");
+
+      try {
+        await fetch(`${API_URL}/transactions/pre-register`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({
+            txHash: sendResponse.hash,
+            type: meta.type,
+            jobId: meta.jobId,
+            milestoneId: meta.milestoneId,
+            maxLedger: maxLedger && !isNaN(maxLedger) ? maxLedger : undefined,
+          }),
+        });
+      } catch {
+        // Pre-registration is best-effort — if it fails we still poll below;
+        // the endpoint will 404 until the record exists, which is treated the
+        // same as a still-pending transaction.
+      }
+      if (sessionChanged()) return staleSessionResult();
+
+      let attempts = 0;
+      while (attempts < STATUS_POLL_MAX_ATTEMPTS) {
+        if (sessionChanged()) return staleSessionResult();
+        try {
+          const statusRes = await fetch(`${API_URL}/transactions/${sendResponse.hash}/status`);
+          if (sessionChanged()) return staleSessionResult();
+          if (statusRes.ok) {
+            const data: { status: TxResolutionStatus; canRetry?: boolean } = await statusRes.json();
+            if (sessionChanged()) return staleSessionResult();
+
+            if (data.status === "SUCCESS") {
+              const successResponse = await server.getTransaction(sendResponse.hash);
+              if (sessionChanged()) return staleSessionResult();
+              const resultXdr =
+                successResponse.status === rpc.Api.GetTransactionStatus.SUCCESS
+                  ? (successResponse as rpc.Api.GetSuccessfulTransactionResponse).returnValue?.toXDR("base64")
+                  : undefined;
+              return { success: true, hash: sendResponse.hash, status: "SUCCESS" as const, resultXdr };
+            }
+
+            if (data.status === "FAILED") {
+              return {
+                success: false,
+                hash: sendResponse.hash,
+                status: "FAILED" as const,
+                canRetry: false,
+                error: "Transaction failed on-chain.",
+              };
+            }
+
+            if (data.status === "EXPIRED") {
+              return {
+                success: false,
+                hash: sendResponse.hash,
+                status: "EXPIRED" as const,
+                canRetry: true,
+                error: "Transaction expired before confirmation and can no longer be included. It can be retried with a fresh sequence number.",
+              };
+            }
+          }
+        } catch {
+          // Transient network error — keep polling.
+        }
+        attempts++;
+        await new Promise((resolve) => setTimeout(resolve, STATUS_POLL_INTERVAL_MS));
+      }
+
+      return {
+        success: false,
+        hash: sendResponse.hash,
+        status: "PENDING" as const,
+        canRetry: false,
+        error: "Still processing on-chain — this is taking longer than usual. Check back in a moment.",
+      };
     } catch (err: unknown) {
+      if (sessionChanged()) return staleSessionResult();
       return {
         success: false,
         hash: "",
@@ -694,23 +1054,35 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       walletType,
       isSessionActive,
       sessionExpiresIn,
+      isReconnecting,
       connect,
       disconnect,
       refreshBalance,
       signMessage,
+      bindWallet,
       signAndBroadcastTransaction,
       extendSession: updateSessionActivity,
     }),
     [
       address, isConnecting, isFreighterInstalled, isLobstrInstalled, error,
       balance, balances, isLoadingBalance, walletType, isSessionActive, sessionExpiresIn,
-      connect, disconnect, refreshBalance, signMessage, signAndBroadcastTransaction, updateSessionActivity,
+      isReconnecting,
+      connect, disconnect, refreshBalance, signMessage, bindWallet, signAndBroadcastTransaction,
+      updateSessionActivity,
     ],
   );
 
   return (
     <WalletContext.Provider value={value}>
       {children}
+
+      {/* Reconnecting wallet banner */}
+      {isReconnecting && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-[130] flex items-center gap-2 rounded-lg border border-theme-border bg-theme-card px-4 py-2 text-sm text-theme-text shadow-lg">
+          <Loader2 size={14} className="animate-spin" />
+          Reconnecting wallet&hellip;
+        </div>
+      )}
 
       {/* Wallet selection modal */}
       {showWalletSelect && (
@@ -819,21 +1191,24 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
             <div className="mb-4">
               <h2 className="text-lg font-semibold text-theme-heading">Extension not found</h2>
               <p className="text-sm text-theme-text mt-1">
-                {isFreighterInstalled === false && walletType !== "lobstr"
-                  ? "Freighter extension is not installed. Please install it to continue."
-                  : "LOBSTR extension is not installed. Please install it to continue."}
+                {notInstalledProvider === "lobstr"
+                  ? "LOBSTR extension is not installed. Please install it to continue."
+                  : "Freighter extension is not installed. Please install it to continue."}
               </p>
             </div>
             <div className="flex gap-3">
               <button
                 type="button"
-                onClick={() => setError(null)}
+                onClick={() => {
+                  setError(null);
+                  setNotInstalledProvider(null);
+                }}
                 className="flex-1 rounded-lg border border-theme-border px-4 py-2 text-sm text-theme-text hover:text-theme-heading"
               >
                 Cancel
               </button>
               <a
-                href={walletType === "lobstr" ? "https://lobstr.co" : "https://freighter.app"}
+                href={notInstalledProvider === "lobstr" ? "https://lobstr.co" : "https://freighter.app"}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex-1 rounded-lg bg-stellar-blue px-4 py-2 text-sm text-white hover:bg-stellar-blue/90 text-center"
@@ -853,6 +1228,27 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
               <h2 className="text-lg font-semibold text-theme-heading">Wallet locked</h2>
               <p className="text-sm text-theme-text mt-1">
                 Please unlock your Freighter wallet and try again.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setError(null)}
+              className="w-full rounded-lg bg-stellar-blue px-4 py-2 text-sm text-white hover:bg-stellar-blue/90"
+            >
+              Got it
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Timeout wallet error */}
+      {error === "TIMEOUT" && (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/60 p-4">
+          <div className="w-full max-w-sm rounded-lg border border-theme-border bg-theme-card p-5 shadow-xl">
+            <div className="mb-4">
+              <h2 className="text-lg font-semibold text-theme-heading">Connection timed out</h2>
+              <p className="text-sm text-theme-text mt-1">
+                Wallet connection timed out. Make sure Freighter is unlocked and try again.
               </p>
             </div>
             <button

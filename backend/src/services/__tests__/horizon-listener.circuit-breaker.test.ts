@@ -162,15 +162,13 @@ describe("getHorizonListenerHealth and getCircuitBreakerStatus exports", () => {
     }));
   });
 
-  it("getHorizonListenerHealth returns 'connected' by default", () => {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const svc = require("../horizon-listener.service");
+  it("getHorizonListenerHealth returns 'connected' by default", async () => {
+    const svc = await import("../horizon-listener.service");
     expect(svc.getHorizonListenerHealth()).toBe("connected");
   });
 
-  it("getCircuitBreakerStatus returns CLOSED state by default", () => {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const svc = require("../horizon-listener.service");
+  it("getCircuitBreakerStatus returns CLOSED state by default", async () => {
+    const svc = await import("../horizon-listener.service");
     expect(svc.getCircuitBreakerStatus().state).toBe("CLOSED");
   });
 });

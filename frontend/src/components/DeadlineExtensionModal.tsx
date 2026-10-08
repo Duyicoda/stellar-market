@@ -6,7 +6,7 @@ import axios, { AxiosError } from "axios";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { Milestone } from "@/types";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api/v1";
 
 type DeadlineExtensionModalProps = {
   milestone: Milestone;
@@ -81,7 +81,7 @@ export default function DeadlineExtensionModal({
     setError(null);
 
     try {
-      const token = localStorage.getItem("token");
+      const token = localStorage.getItem("stellarmarket_jwt");
 
       // Request extension
       const res = await axios.post(

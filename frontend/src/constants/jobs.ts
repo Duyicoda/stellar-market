@@ -8,23 +8,6 @@ export const JOB_CATEGORIES = [
   "DevOps",
 ] as const;
 
-export const JOB_SKILLS = [
-  "Rust",
-  "TypeScript",
-  "React",
-  "Figma",
-  "Solidity",
-  "Node.js",
-  "Python",
-  "Go",
-  "Next.js",
-  "Tailwind",
-  "PostgreSQL",
-  "GraphQL",
-  "Docker",
-  "AWS",
-] as const;
-
 export const PAYMENT_TOKENS = ["XLM", "USDC"] as const;
 
 export type PaymentToken = (typeof PAYMENT_TOKENS)[number];

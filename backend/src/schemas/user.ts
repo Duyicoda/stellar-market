@@ -1,7 +1,6 @@
 import { z } from "zod";
 import {
   emailSchema,
-  optionalStellarAddressSchema,
   paginationSchema,
 } from "./common";
 
@@ -17,7 +16,8 @@ export const updateUserProfileSchema = z.object({
     .array(z.string())
     .max(10, "Cannot have more than 10 skills")
     .optional(),
-  stellarAddress: optionalStellarAddressSchema,
+  // walletAddress is intentionally excluded — use POST /auth/wallet/challenge
+  // then POST /auth/wallet/verify to prove key ownership before binding.
   availability: z.boolean().optional(),
 });
 
@@ -30,7 +30,7 @@ export const getUsersQuerySchema = paginationSchema.extend({
 export const getUserJobsQuerySchema = paginationSchema;
 
 export const getUserByIdParamSchema = z.object({
-  id: z.string().min(1, "User ID is required"),
+  id: z.string().cuid("Invalid id format"),
 });
 
 export const updateCurrentUserProfileSchema = z.object({

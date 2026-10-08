@@ -25,12 +25,12 @@ jest.mock("@prisma/client", () => {
     },
   };
   return {
-    PrismaClient: jest.fn(() => mockPrisma) as any,
+    PrismaClient: jest.fn(() => mockPrisma),
     UserRole: {
       CLIENT: "CLIENT",
       FREELANCER: "FREELANCER",
       ADMIN: "ADMIN",
-    } as any,
+    },
     NotificationType: {
       NEW_MESSAGE: "NEW_MESSAGE",
       JOB_APPLIED: "JOB_APPLIED",
@@ -39,13 +39,23 @@ jest.mock("@prisma/client", () => {
       MILESTONE_APPROVED: "MILESTONE_APPROVED",
       DISPUTE_RAISED: "DISPUTE_RAISED",
       DISPUTE_RESOLVED: "DISPUTE_RESOLVED",
-    } as any,
+    },
   };
 });
 
-// @ts-ignore
 import { PrismaClient } from "@prisma/client";
-const prismaMock = new PrismaClient() as any;
+const prismaMock = new PrismaClient() as unknown as {
+  notification: {
+    create: jest.Mock;
+    findMany: jest.Mock;
+    count: jest.Mock;
+    updateMany: jest.Mock;
+    findUnique: jest.Mock;
+    delete: jest.Mock;
+    deleteMany: jest.Mock;
+  };
+  user: { findUnique: jest.Mock };
+};
 
 // ─── App setup ───────────────────────────────────────────────────────────────
 const app = express();

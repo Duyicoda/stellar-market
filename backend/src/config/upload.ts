@@ -10,8 +10,6 @@ export const ALLOWED_MIME_TYPES = [
   "image/png", // PNG
   "video/mp4", // MP4
   "application/zip", // ZIP
-  "application/x-zip-compressed", // ZIP alternative
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document", // DOCX
 ];
 
 // Max file size: 10MB
@@ -77,7 +75,7 @@ const fileFilter = (
   if (!ALLOWED_MIME_TYPES.includes(file.mimetype)) {
     return cb(
       new Error(
-        `Invalid file type. Allowed types: PDF, JPG, PNG, MP4, ZIP, DOCX`,
+        `Invalid file type. Allowed types: PDF, JPG, PNG, MP4, ZIP`,
       ),
     );
   }

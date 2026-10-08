@@ -1,6 +1,6 @@
 import { Request, Response } from "express";
 import rateLimit, { MemoryStore } from "express-rate-limit";
-import RedisStore from "rate-limit-redis";
+import RedisStore, { RedisReply } from "rate-limit-redis";
 import { getRedisClient } from "../config/redis";
 
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
@@ -30,20 +30,22 @@ const sendTooManyWrites = (req: RateLimitedRequest, res: Response): void => {
 
 // Redis store configuration
 const redisClient = getRedisClient();
+const sendCommand = (...args: string[]): Promise<RedisReply> =>
+  redisClient!.call(args[0], ...args.slice(1)) as Promise<RedisReply>;
+
 const redisStore = redisClient
   ? new RedisStore({
-      sendCommand: (...args: string[]) =>
-        (redisClient as any).call(args[0], ...args.slice(1)),
+      sendCommand,
       prefix: "rate_limit:",
     })
   : undefined;
 
 // When no Redis is configured, use explicit in-memory stores so they can be reset in tests
 const globalStore = redisStore ?? new MemoryStore();
-const loginStore = redisStore ? new RedisStore({ sendCommand: (...args: string[]) => (redisClient as any).call(args[0], ...args.slice(1)), prefix: "rate_limit_login:" }) : new MemoryStore();
-const registerStore = redisStore ? new RedisStore({ sendCommand: (...args: string[]) => (redisClient as any).call(args[0], ...args.slice(1)), prefix: "rate_limit_register:" }) : new MemoryStore();
-const forgotStore = redisStore ? new RedisStore({ sendCommand: (...args: string[]) => (redisClient as any).call(args[0], ...args.slice(1)), prefix: "rate_limit_forgot:" }) : new MemoryStore();
-const writeStore = redisStore ? new RedisStore({ sendCommand: (...args: string[]) => (redisClient as any).call(args[0], ...args.slice(1)), prefix: "rate_limit_write:" }) : new MemoryStore();
+const loginStore = redisStore ? new RedisStore({ sendCommand, prefix: "rate_limit_login:" }) : new MemoryStore();
+const registerStore = redisStore ? new RedisStore({ sendCommand, prefix: "rate_limit_register:" }) : new MemoryStore();
+const forgotStore = redisStore ? new RedisStore({ sendCommand, prefix: "rate_limit_forgot:" }) : new MemoryStore();
+const writeStore = redisStore ? new RedisStore({ sendCommand, prefix: "rate_limit_write:" }) : new MemoryStore();
 
 export const globalRateLimiter = rateLimit({
   windowMs: RATE_LIMIT_WINDOW_MS,
@@ -66,6 +68,11 @@ export const loginRateLimiter = rateLimit({
   legacyHeaders: false,
   store: loginStore,
   passOnStoreError: true,
+  keyGenerator: (req: Request) => {
+    // Normalize IPv6-mapped IPv4 (::ffff:x.x.x.x) to avoid dual-stack bypass
+    return (req.ip ?? req.socket?.remoteAddress ?? "unknown").replace(/^::ffff:/i, "");
+  },
+  validate: { ip: false }, // IP is normalized in keyGenerator above
   handler: sendTooManyRequests,
 });
 
@@ -76,6 +83,11 @@ export const registerRateLimiter = rateLimit({
   legacyHeaders: false,
   store: registerStore,
   passOnStoreError: true,
+  keyGenerator: (req: Request) => {
+    // Normalize IPv6-mapped IPv4 (::ffff:x.x.x.x) to avoid dual-stack bypass
+    return (req.ip ?? req.socket?.remoteAddress ?? "unknown").replace(/^::ffff:/i, "");
+  },
+  validate: { ip: false }, // IP is normalized in keyGenerator above
   handler: sendTooManyRequests,
 });
 
@@ -86,6 +98,11 @@ export const forgotPasswordRateLimiter = rateLimit({
   legacyHeaders: false,
   store: forgotStore,
   passOnStoreError: true,
+  keyGenerator: (req: Request) => {
+    // Normalize IPv6-mapped IPv4 (::ffff:x.x.x.x) to avoid dual-stack bypass
+    return (req.ip ?? req.socket?.remoteAddress ?? "unknown").replace(/^::ffff:/i, "");
+  },
+  validate: { ip: false }, // IP is normalized in keyGenerator above
   handler: sendTooManyRequests,
 });
 
@@ -98,9 +115,13 @@ export const writeRateLimiter = rateLimit({
   passOnStoreError: true,
   keyGenerator: (req: Request) => {
     const rateLimitedReq = req as RateLimitedRequest;
-    return rateLimitedReq.userId || req.ip || "unknown";
+    if (rateLimitedReq.userId) return String(rateLimitedReq.userId);
+    // Normalize IPv6-mapped IPv4 (::ffff:x.x.x.x) to avoid dual-stack bypass
+    const ip = (req.ip ?? req.socket?.remoteAddress ?? "unknown").replace(/^::ffff:/i, "");
+    return ip;
   },
-  skip: (req: Request) => req.method !== "POST",
+  validate: { ip: false }, // IP is normalized in keyGenerator above
+  skip: (req: Request) => req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS",
   handler: sendTooManyWrites,
 });
 

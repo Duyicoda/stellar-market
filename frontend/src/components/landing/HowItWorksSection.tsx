@@ -1,4 +1,5 @@
 import React from "react";
+import Reveal from "./Reveal";
 
 export default function HowItWorksSection() {
   const steps = [
@@ -10,12 +11,14 @@ export default function HowItWorksSection() {
 
   return (
     <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-20 bg-theme-bg">
-      <h2 className="text-3xl font-bold text-theme-heading text-center mb-12">
-        How It Works
-      </h2>
+      <Reveal>
+        <h2 className="text-3xl font-bold text-theme-heading text-center mb-12">
+          How It Works
+        </h2>
+      </Reveal>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-        {steps.map((item) => (
-          <div key={item.step} className="card text-center flex flex-col items-center">
+        {steps.map((item, index) => (
+          <Reveal key={item.step} delay={index * 0.1} hoverLift className="card text-center flex flex-col items-center">
             <div className="text-4xl font-bold bg-gradient-to-r from-stellar-blue to-stellar-purple bg-clip-text text-transparent mb-4">
               {item.step}
             </div>
@@ -23,7 +26,7 @@ export default function HowItWorksSection() {
               {item.title}
             </h3>
             <p className="text-sm text-theme-text">{item.desc}</p>
-          </div>
+          </Reveal>
         ))}
       </div>
     </section>

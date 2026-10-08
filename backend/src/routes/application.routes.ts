@@ -1,5 +1,6 @@
 import { Router, Response } from "express";
-import { PrismaClient, NotificationType } from "@prisma/client";
+import { PrismaClient, NotificationType, Prisma } from "@prisma/client";
+import { z } from "zod";
 import { authenticate, AuthRequest } from "../middleware/auth";
 import { validate } from "../middleware/validation";
 import { asyncHandler } from "../middleware/error";
@@ -34,6 +35,17 @@ router.post(
   asyncHandler(async (req: AuthRequest, res: Response) => {
     const jobId = req.params.jobId as string;
     const { proposal, estimatedDuration, bidAmount } = req.body;
+
+    const freelancer = await prisma.user.findUnique({
+      where: { id: req.userId },
+      select: { walletAddress: true },
+    });
+    if (!freelancer?.walletAddress) {
+      return res.status(422).json({
+        code: "WalletRequired",
+        message: "You must connect a Stellar wallet before applying.",
+      });
+    }
 
     const job = await prisma.job.findUnique({ where: { id: jobId } });
     if (!job) {
@@ -82,6 +94,11 @@ router.post(
     // Invalidate recommendation cache for the freelancer
     await RecommendationService.invalidateUserRecommendations(req.userId!);
 
+    // Broadcast application-count patch so job feed cards update without a full re-fetch.
+    const applicationCount = await prisma.application.count({ where: { jobId } });
+    const { getIo } = await import("../socket");
+    getIo().emit("job:updated", { id: jobId, _count: { applications: applicationCount } });
+
     res.status(201).json(application);
   }),
 );
@@ -96,7 +113,9 @@ router.get(
   }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
     const jobId = req.params.jobId as string;
-    const { page, limit, status } = req.query as any;
+    const { page, limit, status } = req.query as unknown as z.infer<
+      typeof getApplicationsQuerySchema
+    >;
     const skip = (page - 1) * limit;
 
     const job = await prisma.job.findUnique({
@@ -112,7 +131,7 @@ router.get(
         .json({ error: "Not authorized to view applicants for this job." });
     }
 
-    const where: any = { jobId };
+    const where: Prisma.ApplicationWhereInput = { jobId };
     if (status) {
       where.status = status;
     }
@@ -147,10 +166,12 @@ router.get(
   authenticate,
   validate({ query: getApplicationsQuerySchema }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { page, limit, jobId, freelancerId, status } = req.query as any;
+    const { page, limit, jobId, freelancerId, status } = req.query as unknown as z.infer<
+      typeof getApplicationsQuerySchema
+    >;
     const skip = (page - 1) * limit;
 
-    const where: any = {};
+    const where: Prisma.ApplicationWhereInput = {};
     if (jobId) where.jobId = jobId;
     if (freelancerId) where.freelancerId = freelancerId;
     if (status) where.status = status;
@@ -202,6 +223,13 @@ router.put(
       return res.status(403).json({ error: "Not authorized." });
     }
 
+    // If accepting, verify the job is still OPEN
+    if (status === "ACCEPTED" && application.job.status !== "OPEN") {
+      return res.status(409).json({
+        error: "Cannot accept application — job is no longer open.",
+      });
+    }
+
     const updated = await prisma.application.update({
       where: { id },
       data: { status },
@@ -240,20 +268,22 @@ router.put(
           data: { status: "REJECTED" },
         });
 
-        // Notify each rejected freelancer
-        for (const rejectedApp of rejectedApplications) {
-          await NotificationService.sendNotification({
-            userId: rejectedApp.freelancerId,
-            type: NotificationType.APPLICATION_REJECTED,
-            title: "Application Rejected",
-            message: `Your application for "${application.job.title}" has been rejected. Another candidate was selected.`,
-            metadata: { jobId: application.jobId, applicationId: rejectedApp.id },
-          });
-        }
+        // Notify all rejected freelancers in parallel (fire-and-forget after response)
+        void Promise.all(
+          rejectedApplications.map((rejectedApp) =>
+            NotificationService.sendNotification({
+              userId: rejectedApp.freelancerId,
+              type: NotificationType.APPLICATION_REJECTED,
+              title: "Application Rejected",
+              message: `Your application for "${application.job.title}" has been rejected. Another candidate was selected.`,
+              metadata: { jobId: application.jobId, applicationId: rejectedApp.id },
+            })
+          )
+        );
       }
 
-      // Notify the freelancer
-      await NotificationService.sendNotification({
+      // Notify the accepted freelancer (fire-and-forget after response)
+      void NotificationService.sendNotification({
         userId: application.freelancerId,
         type: NotificationType.APPLICATION_ACCEPTED,
         title: "Application Accepted",
@@ -291,6 +321,9 @@ router.put(
         .status(403)
         .json({ error: "Not authorized to update this application." });
     }
+    if (application.status !== "PENDING") {
+      return res.status(409).json({ error: "Cannot edit an accepted or rejected application." });
+    }
 
     const updated = await prisma.application.update({
       where: { id },
@@ -321,7 +354,7 @@ router.delete(
       return res.status(403).json({ error: "Not authorized." });
     }
     if (application.status !== "PENDING") {
-      return res.status(400).json({ error: "Cannot withdraw an accepted or rejected application." });
+      return res.status(409).json({ error: "Cannot withdraw an accepted or rejected application." });
     }
 
     await prisma.application.delete({ where: { id } });

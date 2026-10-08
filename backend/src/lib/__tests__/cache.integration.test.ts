@@ -1,22 +1,47 @@
 import request from "supertest";
 import express from "express";
 import jwt from "jsonwebtoken";
+import { EventEmitter } from "events";
 import { config } from "../../config";
 import jobRouter from "../../routes/job.routes";
 import userRouter from "../../routes/user.routes";
+import { invalidateCache } from "../cache";
+
+// Produces a scanStream-compatible EventEmitter that emits batches then 'end'.
+function makeScanStream(batches: string[][]): EventEmitter {
+  const emitter = new EventEmitter();
+  process.nextTick(() => {
+    for (const batch of batches) {
+      emitter.emit("data", batch);
+    }
+    emitter.emit("end");
+  });
+  return emitter;
+}
 
 // Mock Redis client
 jest.mock("../redis", () => {
+  const mockPipeline = {
+    del: jest.fn().mockReturnThis(),
+    exec: jest.fn().mockResolvedValue([]),
+  };
+
   const mockRedis = {
     get: jest.fn(),
     setex: jest.fn(),
     del: jest.fn(),
     keys: jest.fn(),
+    scanStream: jest.fn(),
+    pipeline: jest.fn(() => mockPipeline),
     status: "ready",
     on: jest.fn(),
     connect: jest.fn(),
     quit: jest.fn(),
+    duplicate: jest.fn(),
   };
+  // recommendation-queue.service.ts duplicates the shared client into a
+  // dedicated blocking-safe connection for its BullMQ Worker.
+  mockRedis.duplicate.mockReturnValue(mockRedis);
 
   return {
     __esModule: true,
@@ -30,8 +55,24 @@ jest.mock("../redis", () => {
 });
 
 // Mock Prisma
+type MockPrismaClient = {
+  job: {
+    findMany: jest.Mock;
+    findUnique: jest.Mock;
+    create: jest.Mock;
+    update: jest.Mock;
+    delete: jest.Mock;
+    count: jest.Mock;
+  };
+  user: {
+    findUnique: jest.Mock;
+    findFirst: jest.Mock;
+    update: jest.Mock;
+  };
+};
+
 jest.mock("@prisma/client", () => {
-  const mockPrisma = {
+  const mockPrisma: MockPrismaClient = {
     job: {
       findMany: jest.fn(),
       findUnique: jest.fn(),
@@ -47,27 +88,41 @@ jest.mock("@prisma/client", () => {
     },
   };
   return {
-    PrismaClient: jest.fn(() => mockPrisma) as any,
+    PrismaClient: jest.fn(() => mockPrisma),
     UserRole: {
       CLIENT: "CLIENT",
       FREELANCER: "FREELANCER",
       ADMIN: "ADMIN",
-    } as any,
+    },
   };
 });
 
-// Suppress TS errors for the mock
-// @ts-ignore
 import { UserRole } from "@prisma/client";
 import { PrismaClient } from "@prisma/client";
+import RedisClientDefault from "../redis";
 
-const prismaMock = new PrismaClient() as any;
+const prismaMock = new PrismaClient() as unknown as MockPrismaClient;
 const jobMock = prismaMock.job;
 const userMock = prismaMock.user;
 
 // Get mock Redis instance
-const RedisClient = require("../redis").default;
-const mockRedis = RedisClient.getInstance();
+type MockRedisClientStatic = {
+  getInstance: jest.Mock;
+  isRedisConnected: jest.Mock;
+  connect: jest.Mock;
+  disconnect: jest.Mock;
+};
+
+const RedisClient = RedisClientDefault as unknown as MockRedisClientStatic;
+const mockRedis = RedisClient.getInstance() as {
+  get: jest.Mock;
+  setex: jest.Mock;
+  del: jest.Mock;
+  keys: jest.Mock;
+  scanStream: jest.Mock;
+  pipeline: jest.Mock;
+};
+const mockPipeline = mockRedis.pipeline();
 
 // App setup
 const app = express();
@@ -88,6 +143,10 @@ function authHeader(userId = USER_TEST_ID) {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  // Re-wire pipeline mock after clearAllMocks so chained .del() calls still work.
+  mockRedis.pipeline.mockReturnValue(mockPipeline);
+  mockPipeline.del.mockReturnValue(mockPipeline);
+  mockPipeline.exec.mockResolvedValue([]);
   // Ensure authenticated requests pass the authenticate middleware
   userMock.findUnique.mockResolvedValue({
     id: USER_TEST_ID,
@@ -97,6 +156,74 @@ beforeEach(() => {
 });
 
 afterEach(() => jest.clearAllMocks());
+
+// ─── invalidateCache unit tests (issue #1185) ────────────────────────────────
+// These tests verify that invalidateCache uses SCAN (non-blocking) instead of
+// KEYS. We do NOT assert on redis.keys — that call must never appear.
+describe("invalidateCache", () => {
+  it("deletes all keys matching the pattern via SCAN + pipeline", async () => {
+    const matchedKeys = ["jobs:list:abc", "jobs:list:def"];
+    mockRedis.scanStream.mockReturnValueOnce(makeScanStream([matchedKeys]));
+
+    await invalidateCache("jobs:list:*");
+
+    // SCAN was called with the correct match pattern.
+    expect(mockRedis.scanStream).toHaveBeenCalledWith({
+      match: "jobs:list:*",
+      count: 100,
+    });
+
+    // Each matched key was queued in the pipeline.
+    expect(mockPipeline.del).toHaveBeenCalledWith("jobs:list:abc");
+    expect(mockPipeline.del).toHaveBeenCalledWith("jobs:list:def");
+    expect(mockPipeline.exec).toHaveBeenCalledTimes(1);
+
+    // The blocking KEYS command must not be called.
+    expect(mockRedis.keys).not.toHaveBeenCalled();
+  });
+
+  it("handles multiple scan batches and deletes all keys", async () => {
+    const batch1 = ["jobs:list:a1", "jobs:list:a2"];
+    const batch2 = ["jobs:list:b1"];
+    mockRedis.scanStream.mockReturnValueOnce(makeScanStream([batch1, batch2]));
+
+    await invalidateCache("jobs:list:*");
+
+    expect(mockPipeline.del).toHaveBeenCalledTimes(3);
+    expect(mockPipeline.exec).toHaveBeenCalledTimes(1);
+    expect(mockRedis.keys).not.toHaveBeenCalled();
+  });
+
+  it("skips pipeline exec when no keys match", async () => {
+    mockRedis.scanStream.mockReturnValueOnce(makeScanStream([[]]));
+
+    await invalidateCache("jobs:list:*");
+
+    expect(mockPipeline.exec).not.toHaveBeenCalled();
+    expect(mockRedis.keys).not.toHaveBeenCalled();
+  });
+
+  it("does nothing when Redis is not connected", async () => {
+    (RedisClient.isRedisConnected as jest.Mock).mockReturnValueOnce(false);
+
+    await invalidateCache("jobs:list:*");
+
+    expect(mockRedis.scanStream).not.toHaveBeenCalled();
+    expect(mockRedis.keys).not.toHaveBeenCalled();
+  });
+
+  it("swallows scan stream errors without throwing", async () => {
+    const errStream = new EventEmitter();
+    mockRedis.scanStream.mockReturnValueOnce(errStream);
+
+    const promise = invalidateCache("jobs:list:*");
+    process.nextTick(() => errStream.emit("error", new Error("scan failed")));
+
+    await expect(promise).resolves.toBeUndefined();
+    expect(mockRedis.keys).not.toHaveBeenCalled();
+  });
+});
+// ─────────────────────────────────────────────────────────────────────────────
 
 describe.skip("Cache Integration Tests", () => {
   describe("GET /api/jobs caching", () => {

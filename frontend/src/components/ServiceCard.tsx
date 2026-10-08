@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { Star, DollarSign, Tag, Clock } from "lucide-react";
 import { ServiceListing } from "@/types";
+import Avatar from "@/components/Avatar";
 
 interface ServiceCardProps {
   service: ServiceListing;
@@ -21,7 +22,7 @@ export default function ServiceCard({ service }: ServiceCardProps) {
           </span>
           <div className="flex items-center gap-1 text-yellow-500">
             <Star size={14} fill="currentColor" />
-            <span className="text-xs font-semibold">{averageRating}</span>
+            <span className="text-xs font-semibold">{averageRating.toFixed(1)}</span>
             <span className="text-xs text-theme-text">({reviewCount})</span>
           </div>
         </div>
@@ -57,7 +58,11 @@ export default function ServiceCard({ service }: ServiceCardProps) {
         </div>
 
         <div className="flex items-center gap-2 pt-4 border-t border-theme-border">
-          <div className="w-6 h-6 rounded-full bg-gradient-to-br from-stellar-blue to-stellar-purple" />
+          <Avatar
+            src={service.freelancer.avatarUrl}
+            alt={service.freelancer.username}
+            size={24}
+          />
           <span className="text-sm text-theme-text">{service.freelancer.username}</span>
         </div>
       </div>

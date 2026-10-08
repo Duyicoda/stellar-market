@@ -28,12 +28,12 @@ jest.mock("@prisma/client", () => {
     },
   };
   return {
-    PrismaClient: jest.fn(() => mockPrisma) as any,
+    PrismaClient: jest.fn(() => mockPrisma),
     UserRole: {
       CLIENT: "CLIENT",
       FREELANCER: "FREELANCER",
       ADMIN: "ADMIN",
-    } as any,
+    },
     NotificationType: {
       NEW_MESSAGE: "NEW_MESSAGE",
       JOB_APPLIED: "JOB_APPLIED",
@@ -42,13 +42,9 @@ jest.mock("@prisma/client", () => {
       MILESTONE_APPROVED: "MILESTONE_APPROVED",
       DISPUTE_RAISED: "DISPUTE_RAISED",
       DISPUTE_RESOLVED: "DISPUTE_RESOLVED",
-    } as any,
+    },
   };
 });
-
-// Suppress TS errors for the mock to avoid compilation issues in tests
-// @ts-ignore
-import { UserRole, NotificationType } from "@prisma/client";
 
 jest.mock("../../services/notification.service", () => ({
   NotificationService: {
@@ -57,7 +53,21 @@ jest.mock("../../services/notification.service", () => ({
 }));
 
 import { PrismaClient } from "@prisma/client";
-const prismaMock = new PrismaClient() as any;
+const prismaMock = new PrismaClient() as unknown as {
+  message: {
+    create: jest.Mock;
+    findMany: jest.Mock;
+    updateMany: jest.Mock;
+    count: jest.Mock;
+  };
+  user: { findUnique: jest.Mock };
+  notification: {
+    create: jest.Mock;
+    findMany: jest.Mock;
+    count: jest.Mock;
+    updateMany: jest.Mock;
+  };
+};
 const messageMock = prismaMock.message;
 const userMock = prismaMock.user;
 
@@ -142,6 +152,54 @@ describe("POST /api/messages", () => {
   });
 });
 
+describe("GET /api/messages", () => {
+  it("filters conversation history by participant, job, sender, and receiver", async () => {
+    messageMock.findMany.mockResolvedValueOnce([]);
+    messageMock.count.mockResolvedValueOnce(0);
+
+    const res = await request(app)
+      .get(
+        `/api/messages?participantId=${USER_OTHER_ID}&jobId=job-123&senderId=${USER_TEST_ID}&receiverId=${USER_OTHER_ID}`,
+      )
+      .set(authHeader());
+
+    expect(res.status).toBe(200);
+    const where = messageMock.findMany.mock.calls[0][0].where;
+    expect(where.AND).toEqual(
+      expect.arrayContaining([
+        { jobId: "job-123" },
+        { senderId: USER_TEST_ID },
+        { receiverId: USER_OTHER_ID },
+        {
+          OR: [
+            { senderId: USER_TEST_ID, receiverId: USER_OTHER_ID },
+            { senderId: USER_OTHER_ID, receiverId: USER_TEST_ID },
+          ],
+        },
+      ]),
+    );
+    expect(messageMock.count.mock.calls[0][0].where).toEqual(where);
+  });
+
+  it("filters conversation lists by sender and receiver", async () => {
+    messageMock.findMany.mockResolvedValueOnce([]);
+
+    const res = await request(app)
+      .get(`/api/messages?senderId=${USER_TEST_ID}&receiverId=${USER_OTHER_ID}`)
+      .set(authHeader());
+
+    expect(res.status).toBe(200);
+    const where = messageMock.findMany.mock.calls[0][0].where;
+    expect(where.AND).toEqual(
+      expect.arrayContaining([
+        { senderId: USER_TEST_ID },
+        { receiverId: USER_OTHER_ID },
+        { OR: [{ senderId: USER_TEST_ID }, { receiverId: USER_TEST_ID }] },
+      ]),
+    );
+  });
+});
+
 // ─── GET /api/messages/unread-count ──────────────────────────────────────────
 describe("GET /api/messages/unread-count", () => {
   it("returns the unread count for the authenticated user", async () => {
@@ -192,8 +250,8 @@ describe("GET /api/messages/conversations", () => {
       .set(authHeader());
 
     expect(res.status).toBe(200);
-    expect(Array.isArray(res.body)).toBe(true);
-    expect(res.body[0]).toMatchObject({
+    expect(Array.isArray(res.body.data)).toBe(true);
+    expect(res.body.data[0]).toMatchObject({
       partner: { username: "bob" },
     });
   });
@@ -226,7 +284,7 @@ describe("GET /api/messages/:userId", () => {
       .set(authHeader());
 
     expect(res.status).toBe(200);
-    expect(res.body).toHaveLength(1);
+    expect(res.body.data).toHaveLength(1);
     expect(messageMock.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({

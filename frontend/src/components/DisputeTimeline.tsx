@@ -1,97 +1,174 @@
 "use client";
 
-import { CheckCircle, Circle, FileText, Scale, Gavel, Clock } from "lucide-react";
-import type { Dispute } from "@/types";
+import { useRef } from "react";
+import { motion } from "framer-motion";
+import {
+  CheckCircle,
+  FileText,
+  Scale,
+  Gavel,
+  Clock,
+  Users,
+} from "lucide-react";
+import LocalTimestamp from "@/components/LocalTimestamp";
+import type { DisputeEvent, DisputeEventType } from "@/hooks/useDisputeStream";
 
 interface DisputeTimelineProps {
-  dispute: Dispute;
+  events: DisputeEvent[];
+  isLive: boolean;
 }
 
-type TimelineEvent = {
-  id: string;
+type TimelinePresentation = {
   icon: React.ReactNode;
   label: string;
   detail?: string;
-  timestamp: string;
-  done: boolean;
 };
 
-export default function DisputeTimeline({ dispute }: DisputeTimelineProps) {
-  // Build events from dispute state
-  const events: TimelineEvent[] = [
-    {
-      id: "opened",
-      icon: <Scale size={16} />,
-      label: "Dispute Opened",
-      detail: `Initiated by ${dispute.initiator.username}`,
-      timestamp: dispute.createdAt,
-      done: true,
-    },
-    {
-      id: "evidence",
-      icon: <FileText size={16} />,
-      label: "Evidence Period",
-      detail: "Parties may submit supporting evidence",
-      timestamp: dispute.createdAt,
-      done: dispute.status !== "OPEN",
-    },
-    {
-      id: "voting",
-      icon: <Gavel size={16} />,
-      label: "Community Voting",
-      detail: `${dispute.votesForClient + dispute.votesForFreelancer} of ${dispute.minVotes} votes cast`,
-      timestamp: dispute.updatedAt,
-      done: dispute.status === "VOTING" || dispute.status === "RESOLVED_CLIENT" || dispute.status === "RESOLVED_FREELANCER",
-    },
-    {
-      id: "resolved",
-      icon: <CheckCircle size={16} />,
-      label: "Resolved",
-      detail:
-        dispute.status === "RESOLVED_CLIENT"
-          ? "Resolved in favour of client"
-          : dispute.status === "RESOLVED_FREELANCER"
-          ? "Resolved in favour of freelancer"
+function describeEvent(event: DisputeEvent): TimelinePresentation {
+  const payload = event.payload ?? {};
+
+  switch (event.type as DisputeEventType) {
+    case "DISPUTE_OPENED":
+      return {
+        icon: <Scale size={16} />,
+        label: "Dispute opened",
+        detail: payload.initiatorUsername
+          ? `Initiated by ${String(payload.initiatorUsername)}`
+          : "Dispute opened by participant",
+      };
+    case "EVIDENCE_SUBMITTED": {
+      const fileCount = Number(payload.fileCount ?? 1);
+      return {
+        icon: <FileText size={16} />,
+        label: "Evidence submitted",
+        detail: `${fileCount} file${fileCount === 1 ? "" : "s"}`,
+      };
+    }
+    case "ARBITRATOR_ASSIGNED":
+      return {
+        icon: <Users size={16} />,
+        label: "Arbitrator panel assigned",
+      };
+    case "VOTE_CAST": {
+      const voteCount = Number(payload.voteCount ?? 0);
+      return {
+        icon: <Gavel size={16} />,
+        label: "Vote cast",
+        detail: voteCount > 0 ? `${voteCount} vote${voteCount === 1 ? "" : "s"} recorded` : undefined,
+      };
+    }
+    case "VERDICT_REACHED":
+      return {
+        icon: <CheckCircle size={16} />,
+        label: "Verdict reached",
+        detail: payload.outcome
+          ? `Resolved in favour of ${String(payload.outcome).toLowerCase()}`
           : undefined,
-      timestamp: dispute.updatedAt,
-      done: dispute.status === "RESOLVED_CLIENT" || dispute.status === "RESOLVED_FREELANCER",
-    },
-  ];
+      };
+    default:
+      return {
+        icon: <Clock size={16} />,
+        label: event.type.replace(/_/g, " ").toLowerCase(),
+      };
+  }
+}
+
+function TimelineItem({
+  event,
+  animate,
+  isLast,
+}: {
+  event: DisputeEvent;
+  animate: boolean;
+  isLast: boolean;
+}) {
+  const presentation = describeEvent(event);
+
+  return (
+    <motion.li
+      initial={animate ? { opacity: 0, y: 20 } : false}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.35, ease: "easeOut" }}
+      className={`mb-6 ml-6 ${isLast ? "mb-0" : ""}`}
+    >
+      <span className="absolute -left-3 flex items-center justify-center w-6 h-6 rounded-full border bg-stellar-blue border-stellar-blue text-white">
+        {presentation.icon}
+      </span>
+      <div>
+        <p className="text-sm font-semibold text-theme-heading">{presentation.label}</p>
+        {presentation.detail && (
+          <p className="text-xs text-theme-text mt-0.5">{presentation.detail}</p>
+        )}
+        <LocalTimestamp
+          isoString={event.createdAt}
+          className="text-[10px] text-theme-text-muted"
+        />
+      </div>
+    </motion.li>
+  );
+}
+
+export default function DisputeTimeline({ events, isLive }: DisputeTimelineProps) {
+  const baselineIds = useRef<Set<number> | null>(null);
+
+  if (events.length > 0 && baselineIds.current === null) {
+    baselineIds.current = new Set(events.map((event) => event.id));
+  }
+
+  const baseline = baselineIds.current ?? new Set<number>();
+  const historicalEvents = events.filter((event) => baseline.has(event.id));
+  const liveEvents = events.filter((event) => !baseline.has(event.id));
+
+  const renderList = (list: DisputeEvent[], animate: boolean) => (
+    <ol className="relative border-l border-theme-border ml-3">
+      {list.map((event, idx) => (
+        <TimelineItem
+          key={event.id}
+          event={event}
+          animate={animate}
+          isLast={idx === list.length - 1}
+        />
+      ))}
+    </ol>
+  );
 
   return (
     <div className="card">
-      <h3 className="font-semibold text-theme-heading mb-4 flex items-center gap-2">
-        <Clock size={18} className="text-stellar-blue" />
-        Dispute Timeline
-      </h3>
-      <ol className="relative border-l border-theme-border ml-3">
-        {events.map((ev, idx) => (
-          <li key={ev.id} className={`mb-6 ml-6 ${idx === events.length - 1 ? "mb-0" : ""}`}>
-            <span
-              className={`absolute -left-3 flex items-center justify-center w-6 h-6 rounded-full border ${
-                ev.done
-                  ? "bg-stellar-blue border-stellar-blue text-white"
-                  : "bg-theme-bg-secondary border-theme-border text-theme-text"
-              }`}
-            >
-              {ev.done ? ev.icon : <Circle size={12} />}
-            </span>
-            <div>
-              <p className={`text-sm font-semibold ${ev.done ? "text-theme-heading" : "text-theme-text"}`}>
-                {ev.label}
-              </p>
-              {ev.detail && (
-                <p className="text-xs text-theme-text mt-0.5">{ev.detail}</p>
-              )}
-              {ev.done && (
-                <time className="text-[10px] text-theme-text-muted">
-                  {new Date(ev.timestamp).toLocaleString()}
-                </time>
-              )}
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="font-semibold text-theme-heading flex items-center gap-2">
+          <Clock size={18} className="text-stellar-blue" />
+          Dispute Timeline
+        </h3>
+        <span className="flex items-center gap-1.5 text-xs font-medium text-theme-text">
+          <span
+            className={`inline-block w-2 h-2 rounded-full ${
+              isLive ? "bg-theme-success" : "bg-theme-text-muted"
+            }`}
+            aria-hidden
+          />
+          {isLive ? "Live" : "Offline"}
+        </span>
+      </div>
+
+      {events.length === 0 ? (
+        <p className="text-sm text-theme-text-muted italic text-center py-4">
+          Waiting for dispute activity…
+        </p>
+      ) : (
+        <>
+          {historicalEvents.length > 0 && renderList(historicalEvents, false)}
+
+          {(historicalEvents.length > 0 || liveEvents.length > 0) && (
+            <div className="relative flex items-center gap-3 my-4 text-[10px] uppercase tracking-wide text-theme-text-muted">
+              <div className="flex-1 border-t border-dashed border-theme-border" />
+              <span>now</span>
+              <div className="flex-1 border-t border-dashed border-theme-border" />
             </div>
-          </li>
-        ))}
-      </ol>
+          )}
+
+          {liveEvents.length > 0 && renderList(liveEvents, true)}
+        </>
+      )}
     </div>
   );
 }

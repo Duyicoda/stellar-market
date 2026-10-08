@@ -1,30 +1,84 @@
 import {
+  Account,
   Address,
   Contract,
   rpc,
   scValToNative,
+  StrKey,
   TransactionBuilder,
   xdr,
   nativeToScVal,
   BASE_FEE,
 } from "@stellar/stellar-sdk";
-import type { PrismaClient } from "@prisma/client";
+import type { PrismaClient, Prisma } from "@prisma/client";
 import { MilestoneStatus } from "@prisma/client";
 import { config } from "../config";
 import { getRequestId } from "../lib/request-context";
 import { logger } from "../lib/logger";
+import { CircuitBreaker } from "../lib/circuit-breaker";
+import type { ApiError } from "../middleware/error";
 
 const networkPassphrase = config.stellar.networkPassphrase;
 const contractId = config.stellar.escrowContractId;
 const READONLY_SOURCE = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 const STROOPS_PER_XLM = 10_000_000n;
 
+const contractCB = new CircuitBreaker({
+  failureThreshold: 5,
+  openDurationMs: 60_000,
+  name: "ContractRpc",
+});
+
 function getRpcServer(): rpc.Server {
   const requestId = getRequestId();
+  const headers = requestId ? { "X-Request-ID": requestId } : undefined;
 
-  return new rpc.Server(config.stellar.rpcUrl, {
-    headers: requestId ? { "X-Request-ID": requestId } : undefined,
-  });
+  const primary = new rpc.Server(config.stellar.rpcUrl, { headers });
+  const secondary = new rpc.Server(config.stellar.secondaryRpcUrl, { headers });
+
+  return new Proxy(primary, {
+    get(target, prop, receiver) {
+      const origValue = Reflect.get(target, prop, receiver);
+      if (typeof origValue === "function") {
+        return async (...args: unknown[]) => {
+          const isPrimaryAllowed = contractCB.allowRequest();
+          if (isPrimaryAllowed) {
+            try {
+              const res = await origValue.apply(target, args);
+              contractCB.onSuccess();
+              return res;
+            } catch (err) {
+              contractCB.onFailure();
+              if (contractCB.getStatus().state === "OPEN") {
+                logger.warn({ err }, "Primary RPC failed, circuit opened. Falling back to secondary RPC.");
+                try {
+                  const secondaryMethod = Reflect.get(secondary, prop);
+                  return await secondaryMethod.apply(secondary, args);
+                } catch (secErr) {
+                  logger.error({ err: secErr }, "Secondary RPC fallback failed.");
+                  const apiErr = new Error("Stellar RPC services unavailable") as ApiError;
+                  apiErr.statusCode = 503;
+                  throw apiErr;
+                }
+              }
+              throw err;
+            }
+          } else {
+            try {
+              const secondaryMethod = Reflect.get(secondary, prop);
+              return await secondaryMethod.apply(secondary, args);
+            } catch (secErr) {
+              logger.error({ err: secErr }, "Secondary RPC failed while circuit is open.");
+              const apiErr = new Error("Stellar RPC services unavailable") as ApiError;
+              apiErr.statusCode = 503;
+              throw apiErr;
+            }
+          }
+        };
+      }
+      return origValue;
+    },
+  }) as rpc.Server;
 }
 
 export type RevisionProposalView = {
@@ -41,6 +95,22 @@ export type RevisionProposalView = {
   createdAt: number;
 };
 
+/** View of the on-chain exchange-rate parity snapshot recorded at funding time. */
+export type RateSnapshotView = {
+  /** TWAP of the funding token in XLM stroops, scaled by 1e7. */
+  twapPriceStroops: string;
+  /** Number of ledger samples the TWAP averaged over. */
+  samples: number;
+  /** Agreed job value in XLM stroops. */
+  agreedValueStroops: string;
+  /** Computed value of the deposit in XLM stroops at funding time. */
+  depositedValueStroops: string;
+  /** Tolerated downside deviation in basis points. */
+  maxSlippageBps: number;
+  /** Ledger sequence at which the snapshot was taken. */
+  ledger: number;
+};
+
 export class ContractSimulationError extends Error {
   constructor(public readonly simulationError: string) {
     super(`Contract simulation failed: ${simulationError}`);
@@ -49,6 +119,14 @@ export class ContractSimulationError extends Error {
 }
 
 export class ContractService {
+  static getCircuitBreakerStatus() {
+    return contractCB.getStatus();
+  }
+
+  static getCircuitBreaker() {
+    return contractCB;
+  }
+
   /**
    * Builds an un-signed transaction XDR for creating a job on-chain.
    */
@@ -61,7 +139,6 @@ export class ContractService {
   ) {
     const server = getRpcServer();
     const contract = new Contract(contractId);
-    const sourceAccount = await server.getLatestLedger(); // Dummy to get ledger, we need account seq
     // Note: To build a tx, we need the account's current sequence number.
     // The frontend can do this, but if the backend does it, it needs the public key.
     
@@ -127,8 +204,19 @@ export class ContractService {
 
   /**
    * Builds an un-signed transaction XDR for funding a job.
+   *
+   * `agreedValueStroops` is the off-chain-agreed job value expressed in XLM
+   * stroops; the contract validates the deposit against a DEX TWAP and rejects
+   * under-value funding. Pass `0n` to bypass the oracle check (native-XLM jobs
+   * and the legacy migration path). `maxSlippageBps` is the tolerated downside
+   * deviation in basis points (e.g. 200 = 2%).
    */
-  static async buildFundJobTx(clientPublicKey: string, jobId: string) {
+  static async buildFundJobTx(
+    clientPublicKey: string,
+    jobId: string,
+    agreedValueStroops: bigint = 0n,
+    maxSlippageBps: number = 0,
+  ) {
     const server = getRpcServer();
     const contract = new Contract(contractId);
     const account = await server.getAccount(clientPublicKey);
@@ -141,13 +229,83 @@ export class ContractService {
       contract.call(
         "fund_job",
         nativeToScVal(BigInt(jobId)),
-        new Address(clientPublicKey).toScVal()
+        new Address(clientPublicKey).toScVal(),
+        nativeToScVal(agreedValueStroops, { type: "i128" }),
+        nativeToScVal(maxSlippageBps, { type: "u32" }),
       )
     )
     .setTimeout(0)
     .build();
 
     return tx.toXDR();
+  }
+
+  /**
+   * Reads the stored exchange-rate parity snapshot for a job, or `null` if the
+   * job was funded without oracle validation (legacy / XLM-only).
+   */
+  static async getRateSnapshot(onChainJobId: string): Promise<RateSnapshotView | null> {
+    const contract = new Contract(contractId);
+    const native = await this.simulateContractRead(
+      contract.call("get_rate_snapshot", nativeToScVal(BigInt(onChainJobId))),
+    );
+    if (native === null || native === undefined) {
+      return null;
+    }
+    const snap = native as {
+      twap_price: bigint | number;
+      samples: number;
+      agreed_value_stroops: bigint | number;
+      deposited_value: bigint | number;
+      max_slippage_bps: number;
+      ledger: number;
+    };
+    return {
+      twapPriceStroops: snap.twap_price.toString(),
+      samples: Number(snap.samples),
+      agreedValueStroops: snap.agreed_value_stroops.toString(),
+      depositedValueStroops: snap.deposited_value.toString(),
+      maxSlippageBps: Number(snap.max_slippage_bps),
+      ledger: Number(snap.ledger),
+    };
+  }
+
+  /**
+   * Simulate `fund_job` so an exchange-rate parity failure can be surfaced as a
+   * structured API error *before* the client signs. Returns `{ ok: true }` when
+   * the deposit would pass, or a typed reason when it would be rejected.
+   *
+   * Network/simulation issues unrelated to parity are reported as `UNKNOWN` so
+   * callers can fall back to building the XDR rather than blocking funding.
+   */
+  static async simulateFundJob(
+    clientPublicKey: string,
+    onChainJobId: string,
+    agreedValueStroops: bigint,
+    maxSlippageBps: number,
+  ): Promise<
+    | { ok: true }
+    | { ok: false; reason: "INSUFFICIENT_VALUE" | "ORACLE_UNAVAILABLE" | "UNKNOWN"; detail?: string }
+  > {
+    const contract = new Contract(contractId);
+    const operation = contract.call(
+      "fund_job",
+      nativeToScVal(BigInt(onChainJobId)),
+      new Address(clientPublicKey).toScVal(),
+      nativeToScVal(agreedValueStroops, { type: "i128" }),
+      nativeToScVal(maxSlippageBps, { type: "u32" }),
+    );
+
+    try {
+      await this.simulateContractRead(operation);
+      return { ok: true };
+    } catch (err) {
+      const detail = err instanceof ContractSimulationError ? err.simulationError : String(err);
+      // EscrowError discriminants: InsufficientValue = 41, OracleUnavailable = 42.
+      if (/#41\b/.test(detail)) return { ok: false, reason: "INSUFFICIENT_VALUE", detail };
+      if (/#42\b/.test(detail)) return { ok: false, reason: "ORACLE_UNAVAILABLE", detail };
+      return { ok: false, reason: "UNKNOWN", detail };
+    }
   }
 
   /**
@@ -228,15 +386,93 @@ export class ContractService {
 
   /**
    * Verification function to check transaction status on-chain.
+   * @deprecated Use verifyTransactionEffects for security-sensitive paths.
    */
   static async verifyTransaction(hash: string) {
     const server = getRpcServer();
     const response = await server.getTransaction(hash);
     if (response.status === rpc.Api.GetTransactionStatus.SUCCESS) {
-        // Extract results if needed
         return { success: true, result: response.resultXdr };
     }
     return { success: false, error: response.status };
+  }
+
+  /**
+   * Verifies a transaction succeeded on-chain AND decodes what it actually did:
+   * which contract was called, which function, with what arguments, and from
+   * which source account. Used by confirm-tx to reject spoofed hash submissions.
+   */
+  static async verifyTransactionEffects(hash: string): Promise<{
+    success: boolean;
+    error?: string;
+    contractId?: string;
+    functionName?: string;
+    args?: unknown[];
+    sourceAccount?: string;
+  }> {
+    const server = getRpcServer();
+    const response = await server.getTransaction(hash);
+
+    if (response.status !== rpc.Api.GetTransactionStatus.SUCCESS) {
+      return { success: false, error: String(response.status) };
+    }
+
+    try {
+      const envelope = (response as rpc.Api.GetSuccessfulTransactionResponse).envelopeXdr;
+      const txBody = envelope.v1().tx();
+
+      // Decode source account (handles both ed25519 and muxed)
+      let sourceAccount: string | undefined;
+      try {
+        const src = txBody.sourceAccount();
+        const switchName = src.switch().name;
+        if (switchName === "keyTypeEd25519") {
+          sourceAccount = StrKey.encodeEd25519PublicKey(src.ed25519());
+        } else if (switchName === "keyTypeMuxedEd25519") {
+          sourceAccount = StrKey.encodeEd25519PublicKey(src.med25519().ed25519());
+        }
+      } catch {
+        // ignore — sourceAccount stays undefined
+      }
+
+      // Find the first invokeHostFunction operation.
+      // The stellar-base XDR bindings type union arm accessors as static factories,
+      // so we cast to access the instance getter.
+      for (const op of txBody.operations()) {
+        const body = op.body();
+        if (body.switch().name !== "invokeHostFunction") continue;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const hostFn = (body as any).invokeHostFunction().hostFunction();
+        if (hostFn.switch().name !== "hostFunctionTypeInvokeContract") continue;
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const invokeArgs = (hostFn as any).invokeContract();
+        let contractId: string | undefined;
+        try {
+          contractId = Address.fromScAddress(invokeArgs.contractAddress()).toString();
+        } catch {
+          contractId = undefined;
+        }
+        const functionName = invokeArgs.functionName().toString();
+        const args: unknown[] = invokeArgs.args().map((a: xdr.ScVal) => {
+          try { return scValToNative(a); } catch { return undefined; }
+        });
+
+        return { success: true, contractId, functionName, args, sourceAccount };
+      }
+
+      // Transaction succeeded but contains no Soroban contract invocation
+      return {
+        success: false,
+        error: "Transaction contains no contract invocation — cannot verify escrow effects",
+      };
+    } catch (err) {
+      logger.warn({ err, hash }, "[ContractService] Failed to decode transaction envelope");
+      return {
+        success: false,
+        error: "Could not decode transaction envelope",
+      };
+    }
   }
 
   /**
@@ -290,10 +526,6 @@ export class ContractService {
 
     // Soroban enums are typically represented as symbols or integers depending on the SDK mapping
     // Here we'll map 0 -> 'Client', 1 -> 'Freelancer' for the VoteChoice enum
-    const choiceScVal = xdr.ScVal.scvVec([
-        xdr.ScVal.scvSymbol(choice === 0 ? "Client" : "Freelancer")
-    ]);
-
     const tx = new TransactionBuilder(account, {
       fee: BASE_FEE,
       networkPassphrase,
@@ -381,7 +613,7 @@ export class ContractService {
         accountId: () => READONLY_SOURCE,
         sequenceNumber: () => "0",
         incrementSequenceNumber: () => {},
-      } as any;
+      } as unknown as Account;
     });
     return new TransactionBuilder(sourceAccount, {
       fee: BASE_FEE,
@@ -397,12 +629,56 @@ export class ContractService {
     const tx = await this.buildReadonlySimTx(operation);
     const simulation = await server.simulateTransaction(tx);
     if (rpc.Api.isSimulationError(simulation)) {
+      const traceId = getRequestId();
+      const txXdr = tx.toXDR();
+      logger.error({
+        traceId,
+        xdr: txXdr,
+        events: (simulation as unknown as { events?: unknown[] }).events ?? [],
+        error: simulation.error,
+      }, "Soroban simulation failed");
+      if (process.env.NODE_ENV !== "production") {
+        void this.writeFailedSimulation(txXdr);
+      }
       throw new ContractSimulationError(simulation.error);
     }
     if (!rpc.Api.isSimulationSuccess(simulation)) {
+      const traceId = getRequestId();
+      const txXdr = tx.toXDR();
+      logger.error({
+        traceId,
+        xdr: txXdr,
+        events: (simulation as unknown as { events?: unknown[] }).events ?? [],
+        error: "Simulation did not succeed — state restore may be required",
+      }, "Soroban simulation did not succeed");
+      if (process.env.NODE_ENV !== "production") {
+        void this.writeFailedSimulation(txXdr);
+      }
       throw new ContractSimulationError("Simulation did not succeed — state restore may be required");
     }
     return scValToNative(simulation.result!.retval);
+  }
+
+  private static async writeFailedSimulation(xdrBase64: string): Promise<void> {
+    try {
+      const fs = await import("fs/promises");
+      const path = await import("path");
+      const dir = path.resolve("logs/failed-simulations");
+      await fs.mkdir(dir, { recursive: true });
+      const filename = path.join(dir, `${Date.now()}.xdr.txt`);
+      await fs.writeFile(filename, xdrBase64, "utf8");
+
+      // Retention: keep at most 50 files, remove oldest excess
+      const MAX_DUMP_FILES = 50;
+      const files = await fs.readdir(dir);
+      if (files.length > MAX_DUMP_FILES) {
+        const sorted = files.sort();
+        const toDelete = sorted.slice(0, files.length - MAX_DUMP_FILES);
+        await Promise.all(toDelete.map((f) => fs.unlink(path.join(dir, f)).catch(() => {})));
+      }
+    } catch {
+      // best-effort; never let logging break the main flow
+    }
   }
 
   /**
@@ -669,7 +945,7 @@ export class ContractService {
         : BigInt(Math.floor(Number(job.total_amount)));
     const budgetXlm = Number(totalStroops) / Number(STROOPS_PER_XLM);
 
-    await prisma.$transaction(async (tx: any) => {
+    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       await tx.milestone.deleteMany({ where: { jobId } });
       const list = job.milestones ?? [];
       for (let i = 0; i < list.length; i++) {
@@ -696,5 +972,102 @@ export class ContractService {
         data: { budget: budgetXlm },
       });
     });
+  }
+
+  /**
+   * Fetches current ledger, expiry ledger, and days remaining for an escrow.
+   */
+  static async getEscrowTtl(onChainJobId: string): Promise<{
+    currentLedger: number;
+    expiryLedger: number;
+    daysRemaining: number;
+  } | null> {
+    try {
+      const server = getRpcServer();
+      const keyScVal = xdr.ScVal.scvVec([
+        xdr.ScVal.scvSymbol("Job"),
+        xdr.ScVal.scvU64(new xdr.Uint64(BigInt(onChainJobId)))
+      ]);
+      
+      const ledgerKey = xdr.LedgerKey.contractData(
+        new xdr.LedgerKeyContractData({
+          contract: Address.fromString(contractId).toScAddress(),
+          key: keyScVal,
+          durability: xdr.ContractDataDurability.persistent(),
+        })
+      );
+
+      const response = await server.getLedgerEntries(ledgerKey);
+      if (!response.entries || response.entries.length === 0) {
+        return null;
+      }
+      
+      const entry = response.entries[0];
+      const currentLedger = response.latestLedger;
+      const expiryLedger = entry.liveUntilLedgerSeq ?? 0;
+      
+      const ledgersRemaining = Math.max(0, expiryLedger - currentLedger);
+      const daysRemaining = (ledgersRemaining * 5) / (24 * 60 * 60);
+      
+      return {
+        currentLedger,
+        expiryLedger,
+        daysRemaining: Number(daysRemaining.toFixed(2)),
+      };
+    } catch (error) {
+      logger.error({ err: error, onChainJobId }, "Error fetching escrow TTL");
+      return null;
+    }
+  }
+
+  /**
+   * Builds an unsigned transaction XDR to extend escrow TTL.
+   */
+  static async buildExtendEscrowTtlTx(callerPublicKey: string, onChainJobId: string): Promise<string> {
+    const server = getRpcServer();
+    const contract = new Contract(contractId);
+    const account = await server.getAccount(callerPublicKey);
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase,
+    })
+      .addOperation(
+        contract.call(
+          "extend_escrow_ttl",
+          nativeToScVal(BigInt(onChainJobId)),
+        ),
+      )
+      .setTimeout(0)
+      .build();
+
+    return tx.toXDR();
+  }
+
+  /**
+   * Fetches the assigned arbitrators for a dispute from the dispute contract.
+   */
+  static async getOnChainAssignedArbitrators(
+    onChainDisputeId: string
+  ): Promise<string[]> {
+    try {
+      const contract = new Contract(config.stellar.disputeContractId);
+      const native = await this.simulateContractRead(
+        contract.call(
+          "get_assigned_arbitrators",
+          nativeToScVal(BigInt(onChainDisputeId))
+        )
+      );
+      if (Array.isArray(native)) {
+        return native.map((addr: unknown) => String(addr));
+      }
+      return [];
+    } catch (error) {
+      logger.warn(
+        { err: error, onChainDisputeId },
+        "get_assigned_arbitrators simulation failed",
+      );
+      return [];
+    }
   }
 }

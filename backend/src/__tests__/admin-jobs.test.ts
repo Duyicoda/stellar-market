@@ -8,8 +8,34 @@
  */
 
 // ─── Prisma mock ─────────────────────────────────────────────────────────────
+type MockPrismaClient = {
+  job: {
+    findMany: jest.Mock;
+    count: jest.Mock;
+    findUnique: jest.Mock;
+    update: jest.Mock;
+    delete: jest.Mock;
+  };
+  user: {
+    findUnique: jest.Mock;
+    update: jest.Mock;
+  };
+  dispute: {
+    findMany: jest.Mock;
+    findUnique: jest.Mock;
+    update: jest.Mock;
+    count: jest.Mock;
+  };
+  auditLog: {
+    create: jest.Mock;
+    findMany: jest.Mock;
+    count: jest.Mock;
+  };
+  $disconnect: jest.Mock;
+};
+
 jest.mock("@prisma/client", () => {
-  const mockPrisma = {
+  const mockPrisma: MockPrismaClient = {
     job: {
       findMany: jest.fn(),
       count: jest.fn(),
@@ -36,9 +62,9 @@ jest.mock("@prisma/client", () => {
   };
 
   return {
-    PrismaClient: jest.fn(() => mockPrisma) as any,
-    UserRole: { CLIENT: "CLIENT", FREELANCER: "FREELANCER", ADMIN: "ADMIN" } as any,
-    DisputeStatus: { OPEN: "OPEN", IN_PROGRESS: "IN_PROGRESS", RESOLVED: "RESOLVED" } as any,
+    PrismaClient: jest.fn(() => mockPrisma),
+    UserRole: { CLIENT: "CLIENT", FREELANCER: "FREELANCER", ADMIN: "ADMIN" },
+    DisputeStatus: { OPEN: "OPEN", IN_PROGRESS: "IN_PROGRESS", RESOLVED: "RESOLVED" },
   };
 });
 
@@ -50,7 +76,22 @@ jest.mock("jsonwebtoken", () => ({
 
 // ─── Config mock (jwtSecret needed by auth middleware) ────────────────────────
 jest.mock("../config", () => ({
-  config: { jwtSecret: "test-secret" },
+  config: {
+    jwtSecret: "test-secret",
+    stellar: {
+      rpcUrl: "https://soroban-testnet.stellar.org",
+      escrowContractId: "",
+      disputeContractId: "",
+      reputationContractId: "",
+    },
+    smtp: {
+      host: "smtp.test",
+      port: 587,
+      user: "",
+      pass: "",
+      from: "noreply@test.io",
+    },
+  },
 }));
 
 // ─── Notification service mock ────────────────────────────────────────────────
@@ -70,7 +111,7 @@ import express from "express";
 import request from "supertest";
 import adminRouter from "../routes/admin";
 
-const prismaMock = new PrismaClient() as any;
+const prismaMock = new PrismaClient() as unknown as MockPrismaClient;
 
 // ─── Minimal Express app for testing ─────────────────────────────────────────
 function buildApp() {

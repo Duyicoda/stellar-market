@@ -1,78 +1,95 @@
 import { Request, Response, NextFunction } from 'express';
 import { ZodError } from 'zod';
+import { AppError } from "../errors/AppError";
+import { ErrorCodes } from "../errors/codes";
 import { logger } from "../lib/logger";
 
 export interface ApiError extends Error {
   statusCode?: number;
-  details?: any;
+  details?: unknown;
+  code?: string;
 }
 
 export const errorHandler = (
   err: ApiError,
   req: Request,
   res: Response,
-  next: NextFunction
+  _next: NextFunction
 ) => {
-  // Default error values
+  let code: string = ErrorCodes.INTERNAL_ERROR;
   let statusCode = err.statusCode || 500;
   let message = err.message || 'Internal Server Error';
-  let details: any = err.details;
+  let details: unknown = err.details;
 
-  // Handle Zod validation errors
-  if (err instanceof ZodError) {
+  if (err instanceof AppError) {
+    code = err.code;
+    statusCode = err.statusCode;
+    message = err.message;
+    details = err.details;
+  } else if (err instanceof ZodError) {
+    code = ErrorCodes.VALIDATION_ERROR;
     statusCode = 400;
-    message = 'Validation Error';
-    details = err.issues.map(error => ({
-      field: error.path.join('.'),
-      message: error.message,
-      code: error.code
+    message = 'Validation failed';
+    details = err.issues.map(issue => ({
+      field: issue.path.join('.'),
+      message: issue.message,
     }));
-  }
-
-  // Handle Prisma errors
-  if (err.name === 'PrismaClientKnownRequestError') {
+  } else if (err.name === 'PrismaClientKnownRequestError') {
+    const prismaErr = err as unknown as { code?: string; meta?: { target?: unknown } };
+    code = ErrorCodes.DATABASE_ERROR;
     statusCode = 400;
     message = 'Database operation failed';
     details = {
-      code: (err as any).code,
-      target: (err as any).meta?.target,
+      prismaCode: prismaErr.code,
+      target: prismaErr.meta?.target,
     };
-  }
-
-  // Handle Soroban simulation errors
-  if (err.name === 'ContractSimulationError') {
+  } else if (err.name === 'ContractSimulationError') {
+    code = ErrorCodes.CONTRACT_SIMULATION_ERROR;
     statusCode = 422;
     message = err.message;
-  }
-
-  // Handle JWT errors
-  if (err.name === 'JsonWebTokenError') {
+  } else if (err.name === 'JsonWebTokenError') {
+    code = ErrorCodes.INVALID_TOKEN;
     statusCode = 401;
     message = 'Invalid token';
-  }
-
-  if (err.name === 'TokenExpiredError') {
+  } else if (err.name === 'TokenExpiredError') {
+    code = ErrorCodes.TOKEN_EXPIRED;
     statusCode = 401;
     message = 'Token expired';
-  }
-
-  if (err.name === 'MulterError') {
+  } else if ((err as unknown as { type?: string }).type === 'entity.too.large') {
+    code = ErrorCodes.PAYLOAD_TOO_LARGE;
+    statusCode = 413;
+    message = 'Request body is too large. Maximum size is 1MB.';
+  } else if (err.name === 'MulterError') {
+    code = ErrorCodes.FILE_UPLOAD_FAILED;
     statusCode = 400;
-    const code = (err as any).code;
-    if (code === 'LIMIT_FILE_SIZE') {
-      message = 'File too large. Avatar must be at most 2MB.';
-    } else if (code === 'LIMIT_UNEXPECTED_FILE') {
-      message = "Unexpected field. Use 'avatar' for the file.";
+    const multerErr = err as unknown as { code?: string, field?: string };
+    const multerCode = multerErr.code;
+    const isAvatarRoute = req.originalUrl.includes('/avatar');
+
+    if (multerCode === 'LIMIT_FILE_SIZE') {
+      code = ErrorCodes.FILE_TOO_LARGE;
+      if (isAvatarRoute) {
+        message = 'File too large. Avatar must be at most 2MB.';
+      } else {
+        message = `File too large for field '${multerErr.field || 'unknown'}'.`;
+      }
+    } else if (multerCode === 'LIMIT_UNEXPECTED_FILE') {
+      code = ErrorCodes.UNEXPECTED_FIELD;
+      if (isAvatarRoute) {
+        message = "Unexpected field. Use 'avatar' for the file.";
+      } else {
+        message = `Unexpected field '${multerErr.field || 'unknown'}'.`;
+      }
     } else {
       message = 'File upload failed.';
     }
   }
 
-  // Log error for debugging
   logger.error(
     {
       err,
-      requestId: (req as any).requestId,
+      errorCode: code,
+      requestId: req.requestId,
       url: req.url,
       method: req.method,
       ip: req.ip,
@@ -80,21 +97,42 @@ export const errorHandler = (
     "Request error",
   );
 
-  // Send consistent error response
+  if (statusCode === 503) {
+    res.setHeader("Retry-After", "30");
+  }
+
+  // Validation errors surface the issues as a top-level `errors` array
+  // matching the {errors: [{field, message}]} contract expected by clients.
+  if (code === ErrorCodes.VALIDATION_ERROR && Array.isArray(details)) {
+    res.status(statusCode).json({
+      code,
+      message,
+      requestId: req.requestId,
+      errors: details,
+    });
+    return;
+  }
+
   res.status(statusCode).json({
+    code,
+    message,
     error: message,
     requestId: req.requestId,
-    ...(details && { details }),
+    ...(details ? { details } : {}),
   });
 };
 
-export const createError = (message: string, statusCode: number = 500, details?: any): ApiError => {
+export const createError = (message: string, statusCode: number = 500, details?: unknown): ApiError => {
   const error = new Error(message) as ApiError;
   error.statusCode = statusCode;
   error.details = details;
   return error;
 };
 
-export const asyncHandler = (fn: Function) => (req: Request, res: Response, next: NextFunction) => {
-  Promise.resolve(fn(req, res, next)).catch(next);
-};
+export const asyncHandler =
+  <Req extends Request = Request>(
+    fn: (req: Req, res: Response, next: NextFunction) => unknown,
+  ) =>
+  (req: Req, res: Response, next: NextFunction) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };

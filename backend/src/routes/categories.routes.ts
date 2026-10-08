@@ -1,16 +1,7 @@
 import { Router, Request, Response } from "express";
+import { JOB_CATEGORIES } from "../constants/categories";
 
 const router = Router();
-
-const JOB_CATEGORIES = [
-  "Frontend",
-  "Backend",
-  "Smart Contract",
-  "Design",
-  "Mobile",
-  "Documentation",
-  "DevOps",
-] as const;
 
 /**
  * @swagger

@@ -1,5 +1,5 @@
 import { Router, Response } from "express";
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, Prisma } from "@prisma/client";
 import fs from "fs";
 import path from "path";
 import { authenticate, AuthRequest } from "../middleware/auth";
@@ -8,7 +8,7 @@ import { asyncHandler } from "../middleware/error";
 import { NotificationService } from "../services/notification.service";
 import { NotificationType } from "@prisma/client";
 import { ContractService } from "../services/contract.service";
-import { upload, UPLOAD_DIR, MAX_FILE_SIZE } from "../config/upload";
+import { upload, UPLOAD_DIR } from "../config/upload";
 import { validateFileMimeType, formatFileSize } from "../utils/fileValidation";
 import { z } from "zod";
 import {
@@ -30,7 +30,9 @@ const freelancerTransitions: Record<string, string[]> = {
 };
 
 const clientTransitions: Record<string, string[]> = {
-  SUBMITTED: ["APPROVED", "REJECTED"],
+  // Approval is chain-owned and can only be projected by the verified
+  // escrow confirmation path; clients may only reject a submission here.
+  SUBMITTED: ["REJECTED"],
 };
 
 // List milestones for a job
@@ -44,6 +46,15 @@ router.get(
     const job = await prisma.job.findUnique({ where: { id: jobId } });
     if (!job) {
       return res.status(404).json({ error: "Job not found." });
+    }
+
+    const isClient = job.clientId === req.userId;
+    const isFreelancer = job.freelancerId === req.userId;
+
+    if (!isClient && !isFreelancer) {
+      return res
+        .status(403)
+        .json({ error: "Not authorized to view milestones for this job." });
     }
 
     const milestones = await prisma.milestone.findMany({
@@ -61,10 +72,34 @@ router.get(
   authenticate,
   validate({ query: getMilestonesQuerySchema }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { page, limit, jobId, status } = req.query as any;
+    const { page, limit, jobId, status } = req.query as unknown as z.infer<
+      typeof getMilestonesQuerySchema
+    >;
     const skip = (page - 1) * limit;
 
-    const where: any = {};
+    // If a specific jobId is requested, verify the caller is a party to that job
+    // before returning any results for it.
+    if (jobId) {
+      const job = await prisma.job.findUnique({ where: { id: jobId } });
+      if (!job) {
+        return res.status(404).json({ error: "Job not found." });
+      }
+      const isParty =
+        job.clientId === req.userId || job.freelancerId === req.userId;
+      if (!isParty) {
+        return res
+          .status(403)
+          .json({ error: "Not authorized to view milestones for this job." });
+      }
+    }
+
+    // Always scope results to milestones belonging to jobs the caller is a
+    // client or freelancer on — preventing cross-user data leaks.
+    const where: Prisma.MilestoneWhereInput = {
+      job: {
+        OR: [{ clientId: req.userId }, { freelancerId: req.userId }],
+      },
+    };
     if (jobId) where.jobId = jobId;
     if (status) where.status = status;
 
@@ -108,7 +143,24 @@ router.post(
         .json({ error: "Not authorized to create milestones for this job." });
     }
 
-    const milestonesCount = await prisma.milestone.count({ where: { jobId } });
+    const existingMilestones = await prisma.milestone.findMany({
+      where: { jobId },
+      select: { amount: true },
+    });
+    const currentTotal = existingMilestones.reduce(
+      (sum, m) => sum + m.amount,
+      0,
+    );
+
+    if (
+      job.budget != null &&
+      Number((currentTotal + amount).toFixed(7)) > Number(job.budget.toFixed(7))
+    ) {
+      return res
+        .status(400)
+        .json({ error: "Total milestone amount exceeds job budget." });
+    }
+
     const milestone = await prisma.milestone.create({
       data: {
         jobId,
@@ -116,7 +168,7 @@ router.post(
         description,
         amount,
         dueDate: new Date(dueDate),
-        order: milestonesCount + 1,
+        order: existingMilestones.length + 1,
       },
       include: {
         job: { select: { id: true, title: true } },
@@ -154,8 +206,8 @@ router.get(
     }
 
     // Check if user is authorized to view this milestone
-    const isClient = (milestone as any).job.clientId === req.userId;
-    const isFreelancer = (milestone as any).job.freelancerId === req.userId;
+    const isClient = milestone.job.clientId === req.userId;
+    const isFreelancer = milestone.job.freelancerId === req.userId;
 
     if (!isClient && !isFreelancer) {
       return res
@@ -191,10 +243,21 @@ router.put(
     if (!milestone) {
       return res.status(404).json({ error: "Milestone not found." });
     }
-    if ((milestone as any).job.clientId !== req.userId) {
+    if (milestone.job.clientId !== req.userId) {
       return res
         .status(403)
         .json({ error: "Not authorized to update this milestone." });
+    }
+
+    if (updateData.amount != null) {
+      const siblings = await prisma.milestone.findMany({
+        where: { jobId: milestone.jobId, NOT: { id } },
+        select: { amount: true },
+      });
+      const otherTotal = siblings.reduce((s, m) => s + m.amount, 0);
+      if (milestone.job.budget != null && Number((otherTotal + updateData.amount).toFixed(7)) > Number(milestone.job.budget.toFixed(7))) {
+        return res.status(400).json({ error: "Total milestone amount exceeds job budget." });
+      }
     }
 
     const updated = await prisma.milestone.update({
@@ -225,7 +288,7 @@ router.delete(
     if (!milestone) {
       return res.status(404).json({ error: "Milestone not found." });
     }
-    if ((milestone as any).job.clientId !== req.userId) {
+    if (milestone.job.clientId !== req.userId) {
       return res
         .status(403)
         .json({ error: "Not authorized to delete this milestone." });
@@ -257,7 +320,7 @@ router.patch(
       return res.status(404).json({ error: "Milestone not found." });
     }
 
-    const job = (milestone as any).job;
+    const job = milestone.job;
     const isClient = job.clientId === req.userId;
     const isFreelancer = job.freelancerId === req.userId;
 
@@ -274,7 +337,7 @@ router.patch(
       : (clientTransitions[currentStatus] || []);
 
     if (!allowedStatuses.includes(status)) {
-      return res.status(403).json({
+      return res.status(400).json({
         error: `Invalid status transition from ${currentStatus} to ${status} for ${isFreelancer ? 'Freelancer' : 'Client'}.`
       });
     }
@@ -301,6 +364,17 @@ router.patch(
         type: NotificationType.MILESTONE_SUBMITTED,
         title: "Milestone Submitted",
         message: `Freelancer submitted milestone: ${milestone.title}`,
+        metadata: { jobId: job.id, milestoneId: id },
+      });
+    }
+
+    // Notify the freelancer when client rejects milestone
+    if (!isFreelancer && status === "REJECTED") {
+      await NotificationService.sendNotification({
+        userId: job.freelancerId as string,
+        type: NotificationType.MILESTONE_REJECTED,
+        title: "Milestone Rejected",
+        message: `Client rejected milestone: ${milestone.title}`,
         metadata: { jobId: job.id, milestoneId: id },
       });
     }
@@ -334,6 +408,10 @@ router.put(
 
     if (milestone.status !== "IN_PROGRESS") {
       return res.status(400).json({ error: "Milestone must be in progress to submit." });
+    }
+
+    if (!milestone.job.freelancer.walletAddress) {
+      return res.status(400).json({ error: "Connect a wallet address before submitting this milestone." });
     }
 
     const xdr = await ContractService.buildSubmitMilestoneTx(
@@ -381,7 +459,7 @@ router.post(
       return res.status(404).json({ error: "Milestone not found." });
     }
 
-    const job = (milestone as any).job;
+    const job = milestone.job;
 
     if (job.freelancerId !== req.userId) {
       fs.unlinkSync(req.file.path);
@@ -450,7 +528,7 @@ router.get(
       return res.status(404).json({ error: "Milestone not found." });
     }
 
-    const job = (milestone as any).job;
+    const job = milestone.job;
     if (job.clientId !== req.userId && job.freelancerId !== req.userId) {
       return res.status(403).json({ error: "Access denied." });
     }
@@ -464,7 +542,7 @@ router.get(
     });
 
     res.json({
-      attachments: attachments.map((a: any) => ({
+      attachments: attachments.map((a) => ({
         ...a,
         sizeFormatted: formatFileSize(a.size),
       })),
@@ -498,7 +576,7 @@ router.delete(
       return res.status(403).json({ error: "Only the uploader can delete this deliverable." });
     }
 
-    if ((attachment as any).milestone?.status === "APPROVED") {
+    if (attachment.milestone?.status === "APPROVED") {
       return res.status(400).json({ error: "Cannot delete a deliverable from an approved milestone." });
     }
 
@@ -538,6 +616,10 @@ router.put(
 
     if (milestone.status !== "SUBMITTED") {
       return res.status(400).json({ error: "Milestone must be submitted to approve." });
+    }
+
+    if (!milestone.job.client.walletAddress) {
+      return res.status(400).json({ error: "Connect a wallet address before approving this milestone." });
     }
 
     const xdr = await ContractService.buildApproveMilestoneTx(

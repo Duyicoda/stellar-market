@@ -73,17 +73,36 @@ enum TransactionType {
   DISPUTE_PAYOUT
 }
 
+enum TransactionStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  EXPIRED
+}
+
 enum NotificationType {
   JOB_APPLIED
   APPLICATION_ACCEPTED
   APPLICATION_REJECTED
   MILESTONE_SUBMITTED
   MILESTONE_APPROVED
+  MILESTONE_REJECTED
   PAYMENT_RELEASED
   DISPUTE_RAISED
   DISPUTE_RESOLVED
   NEW_MESSAGE
   BADGE_AWARDED
+  ESCROW_TTL_WARNING
+  JOB_INVITATION
+  SUSPICIOUS_REPORTER_FLAGGED
+  JOB_REMOVED
+  JOB_EXPIRED
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
 }
 
 enum BadgeTier {
@@ -97,6 +116,14 @@ enum DisputeStatus {
   OPEN
   IN_PROGRESS
   RESOLVED
+}
+
+enum DisputeEventType {
+  DISPUTE_OPENED
+  EVIDENCE_SUBMITTED
+  ARBITRATOR_ASSIGNED
+  VOTE_CAST
+  VERDICT_REACHED
 }
 
 model User {
@@ -120,7 +147,12 @@ model User {
   isSuspended            Boolean   @default(false)
   suspendReason          String?
   suspendedAt            DateTime?
+  deletedAt              DateTime?
   isSuspiciousReporter   Boolean   @default(false)
+  // Incremented on every password change so previously-issued JWTs (which embed
+  // the value at sign time) are rejected by the auth middleware on mismatch.
+  // Invalidates stolen tokens immediately after a password change (issue #787).
+  tokenVersion           Int       @default(0)
   createdAt              DateTime  @default(now())
   updatedAt              DateTime  @updatedAt
   availability           Boolean   @default(true)
@@ -128,48 +160,52 @@ model User {
   reviewCount            Int       @default(0)
   completedOnboarding    Boolean   @default(false)
 
-  clientJobs         Job[]          @relation("ClientJobs")
-  freelancerJobs     Job[]          @relation("FreelancerJobs")
-  services           Service[]      @relation("FreelancerServices")
-  applications       Application[]
-  sentMessages       Message[]      @relation("SentMessages")
-  receivedMessages   Message[]      @relation("ReceivedMessages")
-  reviewsGiven       Review[]       @relation("ReviewsGiven")
-  reviewsReceived    Review[]       @relation("ReviewsReceived")
-  skills             String[]
-  transactionsFrom   Transaction[]  @relation("TransactionsFrom")
-  transactionsTo     Transaction[]  @relation("TransactionsTo")
-  attachments        Attachment[]
-  notifications      Notification[]
-  auditLogs          AuditLog[]
-  initiatedDisputes  Dispute[]      @relation("DisputeInitiated")
-  clientDisputes     Dispute[]      @relation("DisputeClient")
-  freelancerDisputes Dispute[]      @relation("DisputeFreelancer")
-  votesCast          DisputeVote[]  @relation("VotesCast")
-  savedJobs          SavedJob[]     @relation("SavedJobs")
-  reportsGiven       Report[]       @relation("ReportsGiven")
-  badges             Badge[]
+  clientJobs             Job[]                   @relation("ClientJobs")
+  freelancerJobs         Job[]                   @relation("FreelancerJobs")
+  services               Service[]               @relation("FreelancerServices")
+  applications           Application[]
+  invitationsReceived    Invitation[]            @relation("InvitationsReceived")
+  invitationsSent        Invitation[]            @relation("InvitationsSent")
+  sentMessages           Message[]               @relation("SentMessages")
+  receivedMessages       Message[]               @relation("ReceivedMessages")
+  reviewsGiven           Review[]                @relation("ReviewsGiven")
+  reviewsReceived        Review[]                @relation("ReviewsReceived")
+  skills                 String[]
+  transactionsFrom       Transaction[]           @relation("TransactionsFrom")
+  transactionsTo         Transaction[]           @relation("TransactionsTo")
+  attachments            Attachment[]
+  notifications          Notification[]
+  pendingNotifications   PendingNotification[]
+  initiatedDisputes      Dispute[]               @relation("DisputeInitiated")
+  clientDisputes         Dispute[]               @relation("DisputeClient")
+  freelancerDisputes     Dispute[]               @relation("DisputeFreelancer")
+  votesCast              DisputeVote[]           @relation("VotesCast")
+  savedJobs              SavedJob[]              @relation("SavedJobs")
+  reportsGiven           Report[]                @relation("ReportsGiven")
+  badges                 Badge[]
   notificationPreference NotificationPreference?
-  portfolioItems     PortfolioItem[]
-  webhooks           Webhook[]
+  portfolioItems         PortfolioItem[]
+  webhooks               Webhook[]
+  pushSubscriptions      PushSubscription[]      @relation("UserPushSubscriptions")
 
-  referralCode       String?   @unique
-  referredById       String?
-  referredBy         User?     @relation("UserReferrals", fields: [referredById], references: [id], onDelete: SetNull)
-  referrals          User[]    @relation("UserReferrals")
-  referralBonusEarned Float    @default(0)
-  refreshTokens      RefreshToken[]
-  deadlineExtensionRequests DeadlineExtensionRequest[] @relation("ExtensionRequests")
+  referralCode                String?                    @unique
+  referredById                String?
+  referredBy                  User?                      @relation("UserReferrals", fields: [referredById], references: [id], onDelete: SetNull)
+  referrals                   User[]                     @relation("UserReferrals")
+  referralBonusEarned         Float                      @default(0)
+  refreshTokens               RefreshToken[]
+  deadlineExtensionRequests   DeadlineExtensionRequest[] @relation("ExtensionRequests")
   deadlineExtensionRejections DeadlineExtensionRequest[] @relation("ExtensionRejections")
 }
 
 model NotificationPreference {
-  userId                 String   @id
-  emailEnabled           Boolean  @default(true)
-  emailDisputeOpened     Boolean  @default(true)
-  emailMilestoneApproved Boolean  @default(true)
-  emailPaymentReleased   Boolean  @default(true)
+  userId                   String  @id
+  emailEnabled             Boolean @default(true)
+  emailDisputeOpened       Boolean @default(true)
+  emailMilestoneApproved   Boolean @default(true)
+  emailPaymentReleased     Boolean @default(true)
   emailApplicationAccepted Boolean @default(true)
+  marketingEmails          Boolean @default(true)
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
@@ -184,6 +220,11 @@ model Job {
   clientId      String
   freelancerId  String?
   contractJobId String?      @unique
+  // Client-supplied key that makes atomic job+milestone creation idempotent:
+  // retrying a partially-failed "Publish Job" reuses the same key, and the
+  // unique constraint guarantees the retry returns the original job instead of
+  // creating a duplicate (issue #1125).
+  idempotencyKey String?     @unique
   escrowStatus  EscrowStatus @default(UNFUNDED)
   skills        String[]
   deadline      DateTime
@@ -195,19 +236,28 @@ model Job {
   createdAt     DateTime     @default(now())
   updatedAt     DateTime     @updatedAt
 
-  client       User          @relation("ClientJobs", fields: [clientId], references: [id])
-  freelancer   User?         @relation("FreelancerJobs", fields: [freelancerId], references: [id])
-  milestones   Milestone[]
-  applications Application[]
-  messages     Message[]
-  reviews      Review[]
-  transactions Transaction[]
-  attachments  Attachment[]
-  dispute      Dispute?
-  savedBy      SavedJob[]    @relation("SavedByFreelancers")
+  client                    User                       @relation("ClientJobs", fields: [clientId], references: [id])
+  freelancer                User?                      @relation("FreelancerJobs", fields: [freelancerId], references: [id])
+  milestones                Milestone[]
+  applications              Application[]
+  invitations               Invitation[]
+  messages                  Message[]
+  reviews                   Review[]
+  transactions              Transaction[]
+  attachments               Attachment[]
+  dispute                   Dispute?
+  savedBy                   SavedJob[]                 @relation("SavedByFreelancers")
   deadlineExtensionRequests DeadlineExtensionRequest[] @relation("DeadlineExtensions")
+  escrowEvents              EscrowEvent[]
+
+  contractPaused Boolean @default(false)
+  paymentToken   String?
 
   @@index([deletedAt])
+  @@index([clientId])
+  @@index([freelancerId])
+  @@index([paymentToken])
+  @@index([status, createdAt(sort: Desc)])
 }
 
 model Milestone {
@@ -223,32 +273,32 @@ model Milestone {
   dueDate          DateTime?
   createdAt        DateTime        @default(now())
 
-  job                      Job                        @relation(fields: [jobId], references: [id], onDelete: Cascade)
-  transactions             Transaction[]
-  attachments              Attachment[]
+  job                       Job                        @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  transactions              Transaction[]
+  attachments               Attachment[]
   deadlineExtensionRequests DeadlineExtensionRequest[] @relation("MilestoneExtensions")
 }
 
 model DeadlineExtensionRequest {
-  id                String                      @id @default(cuid())
-  milestoneId       String
-  jobId             String
-  requestedById     String
-  newDeadline       DateTime
-  reason            String
-  status            DeadlineExtensionStatus     @default(PENDING)
-  clientApprovedAt  DateTime?
+  id                   String                  @id @default(cuid())
+  milestoneId          String
+  jobId                String
+  requestedById        String
+  newDeadline          DateTime
+  reason               String
+  status               DeadlineExtensionStatus @default(PENDING)
+  clientApprovedAt     DateTime?
   freelancerApprovedAt DateTime?
-  rejectedBy        String?
-  rejectionReason   String?
-  onChainTxHash     String?
-  createdAt         DateTime                    @default(now())
-  updatedAt         DateTime                    @updatedAt
+  rejectedBy           String?
+  rejectionReason      String?
+  onChainTxHash        String?
+  createdAt            DateTime                @default(now())
+  updatedAt            DateTime                @updatedAt
 
-  milestone   Milestone @relation("MilestoneExtensions", fields: [milestoneId], references: [id], onDelete: Cascade)
-  job         Job       @relation("DeadlineExtensions", fields: [jobId], references: [id], onDelete: Cascade)
-  requestedBy User      @relation("ExtensionRequests", fields: [requestedById], references: [id])
-  rejectedByUser User?  @relation("ExtensionRejections", fields: [rejectedBy], references: [id])
+  milestone      Milestone @relation("MilestoneExtensions", fields: [milestoneId], references: [id], onDelete: Cascade)
+  job            Job       @relation("DeadlineExtensions", fields: [jobId], references: [id], onDelete: Cascade)
+  requestedBy    User      @relation("ExtensionRequests", fields: [requestedById], references: [id])
+  rejectedByUser User?     @relation("ExtensionRejections", fields: [rejectedBy], references: [id])
 
   @@index([milestoneId])
   @@index([jobId])
@@ -272,8 +322,26 @@ model Application {
   @@unique([jobId, freelancerId])
 }
 
+model Invitation {
+  id           String           @id @default(cuid())
+  jobId        String
+  freelancerId String
+  clientId     String
+  message      String?
+  status       InvitationStatus @default(PENDING)
+  createdAt    DateTime         @default(now())
+
+  job        Job  @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  freelancer User @relation("InvitationsReceived", fields: [freelancerId], references: [id], onDelete: Cascade)
+  client     User @relation("InvitationsSent", fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@unique([jobId, freelancerId])
+  @@index([freelancerId, createdAt(sort: Desc)])
+}
+
 model Message {
   id         String   @id @default(cuid())
+  clientId   String?  @unique
   senderId   String
   receiverId String
   jobId      String?
@@ -303,32 +371,37 @@ model Review {
 }
 
 model Transaction {
-  id           String          @id @default(cuid())
-  jobId        String
-  milestoneId  String?
-  fromAddress  String
-  toAddress    String
-  amount       Float
-  tokenAddress String
-  txHash       String          @unique
-  type         TransactionType
-  createdAt    DateTime        @default(now())
+  id              String            @id @default(cuid())
+  jobId           String?
+  milestoneId     String?
+  fromAddress     String?
+  toAddress       String?
+  amount          Float?
+  tokenAddress    String?
+  txHash          String            @unique
+  type            TransactionType
+  status          TransactionStatus @default(PENDING)
+  maxLedger       Int?
+  confirmedLedger Int?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
 
-  job       Job        @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  job       Job?       @relation(fields: [jobId], references: [id], onDelete: Cascade)
   milestone Milestone? @relation(fields: [milestoneId], references: [id], onDelete: SetNull)
-  from      User       @relation("TransactionsFrom", fields: [fromAddress], references: [walletAddress])
-  to        User       @relation("TransactionsTo", fields: [toAddress], references: [walletAddress])
+  from      User?      @relation("TransactionsFrom", fields: [fromAddress], references: [walletAddress])
+  to        User?      @relation("TransactionsTo", fields: [toAddress], references: [walletAddress])
 
   @@index([txHash])
   @@index([jobId])
   @@index([fromAddress])
   @@index([toAddress])
   @@index([type])
+  @@index([status])
   @@index([createdAt])
 }
 
 model Attachment {
-  id           String    @id @default(cuid())
+  id           String   @id @default(cuid())
   uploaderId   String
   jobId        String?
   disputeId    String?
@@ -338,7 +411,9 @@ model Attachment {
   mimeType     String
   size         Int
   url          String
-  createdAt    DateTime  @default(now())
+  sha256       String?
+  anchorTxHash String?
+  createdAt    DateTime @default(now())
 
   uploader  User       @relation(fields: [uploaderId], references: [id], onDelete: Cascade)
   job       Job?       @relation(fields: [jobId], references: [id], onDelete: Cascade)
@@ -353,29 +428,75 @@ model Attachment {
 }
 
 model Notification {
-  id        String           @id @default(cuid())
-  userId    String
-  type      NotificationType
-  title     String
-  message   String
-  read      Boolean          @default(false)
-  metadata  Json?
-  createdAt DateTime         @default(now())
+  id          String           @id @default(cuid())
+  userId      String
+  type        NotificationType
+  title       String
+  message     String
+  read        Boolean          @default(false)
+  status      String           @default("pending") // "pending" | "sent" | "failed"
+  deliveredAt DateTime?
+  metadata    Json?
+  createdAt   DateTime         @default(now())
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user                User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  pendingNotification PendingNotification?
 
   @@index([userId, createdAt(sort: Desc)])
 }
 
-model AuditLog {
-  id        String   @id @default(cuid())
-  adminId   String
-  action    String
-  target    String
-  metadata  Json?
-  timestamp DateTime @default(now())
+model PendingNotification {
+  id             String    @id @default(cuid())
+  userId         String
+  notificationId String    @unique
+  priority       Int       @default(3)
+  deliveredAt    DateTime?
+  createdAt      DateTime  @default(now())
 
-  admin User @relation(fields: [adminId], references: [id])
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  notification Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+
+  @@index([userId, deliveredAt, priority])
+}
+
+/// Category of an audit entry. Both admin actions and security events now
+/// share the single, hash-chained AuditLog table (issue #875).
+enum AuditCategory {
+  ADMIN_ACTION
+  SECURITY_EVENT
+}
+
+/// Unified, append-only, tamper-evident audit trail.
+///
+/// Every entry is linked to its predecessor via `prevHash`, and `hash` is the
+/// SHA-256 of the entry's canonical content combined with `prevHash`. Because
+/// each row commits to the one before it, altering or deleting any historical
+/// row breaks the chain and is detectable by recomputing it (see
+/// AuditService.verifyChain).
+///
+/// `sequence` is assigned contiguously by the single-writer outbox worker, so a
+/// gap in the sequence is itself evidence that a row was removed.
+///
+/// `actorId` is intentionally a free-form string (no FK): it may be an admin
+/// user id, an end-user id, or the sentinel "system" for background events such
+/// as virus-scan results, none of which map cleanly onto a single User FK.
+model AuditLog {
+  id        String        @id @default(cuid())
+  sequence  Int           @unique
+  category  AuditCategory
+  action    String
+  actorId   String?
+  target    String?
+  metadata  Json?
+  ipAddress String?
+  prevHash  String?
+  hash      String
+  timestamp DateTime      @default(now())
+
+  @@index([category])
+  @@index([action])
+  @@index([actorId])
+  @@index([timestamp])
 }
 
 model Dispute {
@@ -392,18 +513,31 @@ model Dispute {
   createdAt        DateTime      @default(now())
   updatedAt        DateTime      @updatedAt
 
-  job         Job           @relation(fields: [jobId], references: [id], onDelete: Cascade)
-  client      User          @relation("DisputeClient", fields: [clientId], references: [id])
-  freelancer  User          @relation("DisputeFreelancer", fields: [freelancerId], references: [id])
-  initiator   User          @relation("DisputeInitiated", fields: [initiatorId], references: [id])
+  job         Job            @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  client      User           @relation("DisputeClient", fields: [clientId], references: [id])
+  freelancer  User           @relation("DisputeFreelancer", fields: [freelancerId], references: [id])
+  initiator   User           @relation("DisputeInitiated", fields: [initiatorId], references: [id])
   votes       DisputeVote[]
   attachments Attachment[]
+  events      DisputeEvent[]
 
   @@index([jobId])
   @@index([clientId])
   @@index([freelancerId])
   @@index([initiatorId])
   @@index([status])
+}
+
+model DisputeEvent {
+  id        Int              @id @default(autoincrement())
+  disputeId String
+  type      DisputeEventType
+  payload   Json?
+  createdAt DateTime         @default(now())
+
+  dispute Dispute @relation(fields: [disputeId], references: [id], onDelete: Cascade)
+
+  @@index([disputeId, id])
 }
 
 model DisputeVote {
@@ -482,6 +616,28 @@ model SyncState {
   id                String   @id @default("default")
   lastIndexedLedger Int      @default(0)
   updatedAt         DateTime @updatedAt
+}
+
+model HorizonCursor {
+  id          Int       @id @default(1)
+  cursor      String
+  updatedAt   DateTime  @default(now()) @updatedAt @map("updated_at")
+  lastEventAt DateTime? @map("last_event_at")
+
+  @@map("horizon_cursor")
+}
+
+model HorizonDlq {
+  id         Int       @id @default(autoincrement())
+  cursor     String
+  payload    Json
+  error      String
+  attempt    Int       @default(1)
+  createdAt  DateTime  @default(now()) @map("created_at")
+  replayedAt DateTime? @map("replayed_at")
+
+  @@index([replayedAt, cursor])
+  @@map("horizon_dlq")
 }
 
 model Badge {
@@ -563,4 +719,138 @@ model WebhookDelivery {
   @@index([webhookId])
   @@index([status])
   @@index([nextRetry])
+}
+
+enum EscrowEventType {
+  JOB_CREATED
+  JOB_FUNDED
+  PAYMENT_RELEASED
+  DISPUTE_OPENED
+  DISPUTE_RESOLVED
+  REFUNDED
+  EXPIRED
+}
+
+model EscrowEvent {
+  id            String          @id @default(cuid())
+  jobId         String
+  contractJobId String
+  eventType     EscrowEventType
+  ledgerSeq     Int
+  txHash        String
+  payload       Json
+  processedAt   DateTime        @default(now())
+
+  job Job @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@unique([contractJobId, eventType, ledgerSeq])
+  @@index([jobId, ledgerSeq])
+}
+
+model PushSubscription {
+  id        String   @id @default(cuid())
+  userId    String
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  createdAt DateTime @default(now())
+
+  user User @relation("UserPushSubscriptions", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Skill {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  category  String?
+  aliases   String[]
+  createdAt DateTime @default(now())
+
+  @@index([name])
+}
+
+// ─── Fraud / anomaly detection (issue #900) ──────────────────────────────────
+
+/// The kind of entity a risk assessment is computed for.
+enum RiskSubjectType {
+  USER
+  JOB
+  TRANSACTION
+}
+
+/// Coarse risk band derived from the numeric score. Thresholds are tunable and
+/// live in fraud-detection.service.ts, not the database.
+enum RiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+/// What caused a scoring run to happen. ESCROW_RELEASE and JOB_CREATED are the
+/// near-real-time hooks; BATCH is a periodic sweep; MANUAL is an admin re-score.
+enum RiskTrigger {
+  JOB_CREATED
+  ESCROW_RELEASE
+  MANUAL
+  BATCH
+}
+
+/// Lifecycle of an entry in the admin review queue. FALSE_POSITIVE is the
+/// feedback signal used to tune thresholds; CONFIRMED escalates.
+enum RiskFlagStatus {
+  OPEN
+  UNDER_REVIEW
+  CONFIRMED
+  FALSE_POSITIVE
+  DISMISSED
+}
+
+/// Append-only record of every risk scoring run. Persisting each run (rather
+/// than only a live computation) gives an auditable history of how a subject's
+/// score changed over time and exactly which signals produced it. Never mutated
+/// or deleted; the current score for a subject is simply its newest row.
+model RiskAssessment {
+  id          String          @id @default(cuid())
+  subjectType RiskSubjectType
+  subjectId   String
+  score       Float
+  level       RiskLevel
+  /// Array of contributing signals: [{ code, value, weight, contribution, detail }].
+  signals     Json
+  trigger     RiskTrigger
+  createdAt   DateTime        @default(now())
+
+  flag   RiskFlag? @relation(fields: [flagId], references: [id], onDelete: SetNull)
+  flagId String?
+
+  @@index([subjectType, subjectId, createdAt])
+  @@index([level])
+  @@index([createdAt])
+}
+
+/// One row per subject that has crossed the review threshold — the admin review
+/// queue. Deliberately does NOT block or suspend anyone: it only surfaces
+/// activity for a human. `status` carries the review outcome, and a
+/// FALSE_POSITIVE outcome (with reviewer note) feeds back into threshold tuning.
+model RiskFlag {
+  id           String          @id @default(cuid())
+  subjectType  RiskSubjectType
+  subjectId    String
+  currentScore Float
+  currentLevel RiskLevel
+  status       RiskFlagStatus  @default(OPEN)
+  reviewedById String?
+  reviewedAt   DateTime?
+  reviewNote   String?
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  assessments RiskAssessment[]
+
+  @@unique([subjectType, subjectId])
+  @@index([status])
+  @@index([currentLevel])
+  @@index([updatedAt])
 }

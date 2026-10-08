@@ -1,7 +1,8 @@
 import { Metadata } from "next";
 import ProfileClient from "./ProfileClient";
+import { generateProfileMetadata } from "@/components/SEOMetadata";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api/v1";
 
 async function getProfile(id: string) {
   try {
@@ -34,30 +35,12 @@ export async function generateMetadata({
     };
   }
 
-  const title = `${profile.username} | StellarMarket`;
-  const description =
-    profile.bio?.substring(0, 160) ||
-    `Check out ${profile.username}'s profile on StellarMarket.`;
-  const image = profile.avatarUrl ?? `${baseUrl}/og-image.png`;
-
-  return {
-    title,
-    description,
-    alternates: { canonical },
-    openGraph: {
-      title,
-      description,
-      url: canonical,
-      type: "profile",
-      images: [{ url: image, width: 1200, height: 630, alt: profile.username }],
-    },
-    twitter: {
-      card: "summary_large_image",
-      title,
-      description,
-      images: [image],
-    },
-  };
+  return generateProfileMetadata({
+    name: profile.username,
+    bio: profile.bio || `Check out ${profile.username}'s profile on StellarMarket.`,
+    avatar: profile.avatarUrl,
+    url: canonical,
+  });
 }
 
 export default function ProfilePage() {

@@ -11,7 +11,7 @@ import Pagination from "@/components/Pagination";
 import DisputeCardSkeleton from "@/components/skeletons/DisputeCardSkeleton";
 import { Dispute, PaginatedResponse } from "@/types";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api/v1";
 const ITEMS_PER_PAGE = 10;
 
 type TabType = "my-disputes" | "my-votes" | "open-for-voting";
@@ -118,13 +118,15 @@ export default function DisputesDashboardPage() {
         <>
           <div className="space-y-4">
             {disputes.map((dispute) => (
-              <Link
+              <div
                 key={dispute.id}
-                href={`/disputes/${dispute.id}`}
-                className="block bg-theme-card border border-theme-border rounded-xl p-6 hover:border-stellar-blue transition-colors"
+                className="bg-theme-card border border-theme-border rounded-xl p-6 hover:border-stellar-blue transition-colors"
               >
                 <div className="flex items-start justify-between gap-4">
-                  <div className="flex-1 min-w-0">
+                  <Link
+                    href={`/disputes/${dispute.id}`}
+                    className="flex-1 min-w-0"
+                  >
                     <div className="flex items-center gap-3 mb-2">
                       <h3 className="text-lg font-semibold text-theme-heading truncate">
                         Dispute #{dispute.id.slice(0, 8)}
@@ -147,14 +149,17 @@ export default function DisputesDashboardPage() {
                         </span>
                       )}
                     </div>
-                  </div>
+                  </Link>
                   {activeTab === "open-for-voting" && (
-                    <button className="btn-primary px-4 py-2 text-sm shrink-0">
+                    <Link
+                      href={`/disputes/${dispute.id}#vote-panel`}
+                      className="btn-primary px-4 py-2 text-sm shrink-0"
+                    >
                       Vote Now
-                    </button>
+                    </Link>
                   )}
                 </div>
-              </Link>
+              </div>
             ))}
           </div>
 

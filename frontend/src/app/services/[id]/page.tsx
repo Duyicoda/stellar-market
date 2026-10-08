@@ -7,8 +7,9 @@ import { Star, Tag, Clock, ChevronLeft, MessageSquare, ShieldCheck } from "lucid
 import axios from "axios";
 import { ServiceListing } from "@/types";
 import ShareMenu from "@/components/ShareMenu";
+import Avatar from "@/components/Avatar";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api/v1";
 
 export default function ServiceDetailPage() {
   const { id } = useParams();
@@ -130,8 +131,8 @@ export default function ServiceDetailPage() {
               </div>
             </div>
 
-            <button 
-              onClick={() => router.push(`/messages?recipientId=${service.freelancerId}`)}
+            <button
+              onClick={() => router.push(`/messages/${service.freelancerId}-no-job`)}
               className="btn-primary w-full flex items-center justify-center gap-2 h-12"
             >
               Contact Freelancer <MessageSquare size={20} />
@@ -141,7 +142,11 @@ export default function ServiceDetailPage() {
           <div className="card">
             <h3 className="text-lg font-bold text-theme-heading mb-4">About the Seller</h3>
             <div className="flex items-center gap-4 mb-4">
-              <div className="w-14 h-14 rounded-full bg-gradient-to-br from-stellar-blue to-stellar-purple" />
+              <Avatar
+                src={service.freelancer.avatarUrl}
+                alt={service.freelancer.username}
+                size={56}
+              />
               <div>
                 <div className="font-bold text-theme-heading">{service.freelancer.username}</div>
                 <div className="text-sm text-theme-text">{service.freelancer.role}</div>

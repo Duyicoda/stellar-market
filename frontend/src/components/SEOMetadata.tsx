@@ -75,23 +75,21 @@ export function generateProfileMetadata(profile: {
   tagline?: string;
   bio: string;
   avatar?: string;
-  username: string;
+  url: string;
 }): Metadata {
-  const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? "https://stellarmarket.io";
-  const title = profile.tagline 
-    ? `${profile.name} - ${profile.tagline}`
+  const title = profile.tagline
+    ? `${profile.name} — ${profile.tagline}`
     : profile.name;
-  
-  const description = profile.bio.length > 160 
-    ? `${profile.bio.substring(0, 157)}...` 
+
+  const description = profile.bio.length > 160
+    ? `${profile.bio.substring(0, 157)}...`
     : profile.bio;
-  const canonical = new URL(`/u/${profile.username}`, siteUrl).toString();
-  
+
   return generateSEOMetadata({
     title,
     description,
     image: profile.avatar || '/og-image.png',
-    url: canonical,
+    url: profile.url,
     type: 'profile',
   });
 }
