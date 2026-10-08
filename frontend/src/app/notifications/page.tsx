@@ -7,6 +7,7 @@ import { useAuth } from "@/context/AuthContext";
 import { useSocket } from "@/context/SocketContext";
 import { Notification, PaginatedResponse } from "@/types";
 import NotificationItem from "@/components/NotificationItem";
+import ConfirmDialog from "@/components/ConfirmDialog";
 import Pagination from "@/components/Pagination";
 import EmptyState from "@/components/EmptyState";
 
@@ -21,12 +22,15 @@ export default function NotificationsPage() {
   const [loading, setLoading] = useState(true);
   const [markingAll, setMarkingAll] = useState(false);
   const [hasUnread, setHasUnread] = useState(false);
+  const [confirmingClearRead, setConfirmingClearRead] = useState(false);
   const mergedNotifications = [
     ...liveNotifications,
     ...notifications.filter(
       (n) => !liveNotifications.some((ln) => ln.id === n.id),
     ),
   ];
+
+  const readCount = notifications.filter((n) => n.read).length;
 
   const limit = 10;
 
@@ -187,6 +191,14 @@ export default function NotificationsPage() {
     }
   };
 
+  // Bulk clearing is destructive, so it asks for confirmation first.
+  const closeClearReadConfirm = useCallback(() => setConfirmingClearRead(false), []);
+
+  const confirmClearRead = () => {
+    setConfirmingClearRead(false);
+    void clearReadNotifications();
+  };
+
   if (!user) {
     return (
       <div className="max-w-4xl mx-auto px-4 py-20 text-center">
@@ -212,7 +224,7 @@ export default function NotificationsPage() {
 
         <div className="flex items-center gap-3">
           <button
-            onClick={clearReadNotifications}
+            onClick={() => setConfirmingClearRead(true)}
             disabled={notifications.every((n) => !n.read)}
             className="flex items-center gap-2 px-3 py-2 rounded-lg bg-theme-border/50 text-theme-heading hover:bg-theme-border transition-colors disabled:opacity-50 text-sm font-medium border border-theme-border"
           >
@@ -276,6 +288,16 @@ export default function NotificationsPage() {
           />
         )}
       </div>
+
+      <ConfirmDialog
+        isOpen={confirmingClearRead}
+        title="Clear read notifications?"
+        description={`${readCount} read notification${readCount === 1 ? "" : "s"} will be permanently removed. This action cannot be undone.`}
+        confirmLabel="Clear"
+        cancelLabel="Cancel"
+        onConfirm={confirmClearRead}
+        onCancel={closeClearReadConfirm}
+      />
     </div>
   );
 }

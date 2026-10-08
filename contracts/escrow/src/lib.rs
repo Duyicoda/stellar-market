@@ -1231,6 +1231,11 @@ impl EscrowContract {
         Ok(count)
     }
 
+    /// Return a multi-sig proposal by id, whether it is pending or archived.
+    pub fn get_multisig_proposal(env: Env, proposal_id: u64) -> Option<MultiSigProposal> {
+        load_proposal(&env, proposal_id)
+    }
+
     /// Record an additional approval on a pending multi-sig proposal. When the
     /// approval count reaches the threshold and the time-lock has elapsed, the
     /// proposal executes immediately (so execution errors below can surface from
