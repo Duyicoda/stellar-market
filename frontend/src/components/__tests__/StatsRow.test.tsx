@@ -82,6 +82,16 @@ describe("StatsRow component", () => {
     );
   });
 
+  it("shows an error message when the fetch fails", async () => {
+    (useAuth as jest.Mock).mockReturnValue({ token: "fake-token" });
+    mockedAxios.get.mockRejectedValueOnce(new Error("boom"));
+
+    renderComponent();
+
+    expect(await screen.findByText("Couldn't load stats")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+  });
+
   it("does not fetch if token is missing", () => {
     (useAuth as jest.Mock).mockReturnValue({ token: null });
     
