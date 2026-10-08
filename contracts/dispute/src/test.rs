@@ -3188,6 +3188,61 @@ fn test_resolve_dispute_escrow_fail_enters_resolution_failed() {
     assert_eq!(dispute.status, DisputeStatus::ResolutionFailed);
 }
 
+#[test]
+fn test_escrow_fail_event_includes_resolution_context() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, job_client, freelancer, dispute_id) = setup_dispute_with_failing_escrow(&env);
+    let assigned = client.get_assigned_arbitrators(&dispute_id);
+
+    client.cast_vote(
+        &dispute_id,
+        &assigned.get(0).unwrap(),
+        &VoteChoice::Client,
+        &String::from_str(&env, "r"),
+        &0u64,
+    );
+    client.cast_vote(
+        &dispute_id,
+        &assigned.get(1).unwrap(),
+        &VoteChoice::Client,
+        &String::from_str(&env, "r"),
+        &1u64,
+    );
+    client.cast_vote(
+        &dispute_id,
+        &assigned.get(2).unwrap(),
+        &VoteChoice::Client,
+        &String::from_str(&env, "r"),
+        &2u64,
+    );
+
+    let events = env.events().all();
+    let fail_event = events.iter().find(|(_, topics, _)| {
+        if topics.len() >= 2 {
+            let t1: Symbol = topics.get(1).unwrap().into_val(&env);
+            return t1 == Symbol::new(&env, "escrow_fail");
+        }
+        false
+    });
+
+    assert!(fail_event.is_some(), "escrow_fail event should be emitted");
+
+    let (_, _, data) = fail_event.unwrap();
+    let actual: (u64, DisputeStatus, u64, Address, Address, DisputeResolution) =
+        soroban_sdk::TryFromVal::try_from_val(&env, &data).unwrap();
+    let expected = (
+        dispute_id,
+        DisputeStatus::ResolutionFailed,
+        1u64,
+        job_client,
+        freelancer,
+        DisputeResolution::ClientWins,
+    );
+    assert_eq!(actual, expected);
+}
+
 /// After escrow is fixed, retry_escrow_callback transitions the dispute to the
 /// correct terminal status (ResolvedForClient here).
 #[test]
@@ -4195,6 +4250,47 @@ fn test_get_appeal_success() {
     assert_eq!(ap.votes_for_freelancer, 0);
     assert_eq!(ap.votes_for_refund_split, 0);
     assert_eq!(ap.refund_split_sum, 0);
+}
+
+#[test]
+fn test_get_appeal_votes() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let dispute_contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &dispute_contract_id);
+    let escrow_id = env.register_contract(None, DummyEscrow);
+    let rep_id = env.register_contract(None, MockReputationContract);
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &rep_id, &300, &escrow_id);
+
+    for _ in 0..5 {
+        client.add_arbitrator(&admin, &Address::generate(&env));
+    }
+
+    let user_client = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+    let dispute_id = client.raise_dispute(
+        &1u64, &user_client, &freelancer, &user_client,
+        &String::from_str(&env, "Issue"), &3u32, &None,
+    );
+    resolve_dispute_for_client(&env, &client, dispute_id);
+    let appeal_id = client.appeal(&dispute_id, &user_client);
+
+    assert_eq!(client.get_appeal_votes(&appeal_id).len(), 0);
+
+    let voter = Address::generate(&env);
+    let reason = String::from_str(&env, "Evidence supports the client");
+    let timestamp = env.ledger().timestamp();
+    client.cast_appeal_vote(&appeal_id, &voter, &VoteChoice::Client, &reason);
+
+    let votes = client.get_appeal_votes(&appeal_id);
+    assert_eq!(votes.len(), 1);
+    let vote = votes.get(0).unwrap();
+    assert_eq!(vote.voter, voter);
+    assert_eq!(vote.choice, VoteChoice::Client);
+    assert_eq!(vote.reason, reason);
+    assert_eq!(vote.timestamp, timestamp);
 }
 
 // ─── get_dispute_by_job / get_disputes_for_job tests ─────────────────────

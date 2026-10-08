@@ -3598,6 +3598,36 @@ fn test_multisig_pause_flow() {
 }
 
 #[test]
+fn test_get_multisig_proposal_reads_pending_archived_and_unknown_ids() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let (contract, _, _, _, signer1, _) = setup_multisig(&env);
+    let proposal_id = contract.propose_admin_action(
+        &signer1,
+        &AdminAction::AddSigner(Address::generate(&env)),
+    );
+
+    let pending = contract
+        .get_multisig_proposal(&proposal_id)
+        .expect("Pending proposal should be returned");
+    assert_eq!(pending.id, proposal_id);
+    assert!(!pending.executed);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp += PROPOSAL_TTL + 1);
+    contract.prune_expired_proposal(&proposal_id);
+
+    let archived = contract
+        .get_multisig_proposal(&proposal_id)
+        .expect("Archived proposal should be returned");
+    assert_eq!(archived.id, proposal_id);
+    assert!(!archived.executed);
+    assert!(contract.get_multisig_proposal(&999).is_none());
+}
+
+#[test]
 fn test_multisig_unauthorized_proposal() {
     let env = Env::default();
     env.mock_all_auths();
