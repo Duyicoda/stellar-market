@@ -19,7 +19,7 @@ interface UseFocusTrapOptions {
 }
 
 export function useFocusTrap(
-  containerRef: RefObject<HTMLElement | null>,
+  containerRef: RefObject | null>,
   { open, onClose, initialFocusRef }: UseFocusTrapOptions,
 ) {
   const previousFocusRef = useRef<HTMLElement | null>(null);
@@ -32,16 +32,17 @@ export function useFocusTrap(
     const container = containerRef.current;
     if (!container) return;
 
-    const focusableElements = Array.from(
-      container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTORS),
-    );
-    const firstFocusable = focusableElements[0];
-    const lastFocusable = focusableElements[focusableElements.length - 1];
+    const getFocusableElements = () =>
+      Array.from(
+        container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTORS),
+      );
+
+    const initialFocusable = getFocusableElements()[0];
 
     if (initialFocusRef?.current) {
       initialFocusRef.current.focus();
     } else {
-      firstFocusable?.focus();
+      initialFocusable?.focus();
     }
 
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -50,7 +51,13 @@ export function useFocusTrap(
         return;
       }
 
-      if (event.key !== "Tab" || focusableElements.length === 0) return;
+      if (event.key !== "Tab") return;
+
+      const focusableElements = getFocusableElements();
+      if (focusableElements.length === 0) return;
+
+      const firstFocusable = focusableElements[0];
+      const lastFocusable = focusableElements[focusableElements.length - 1];
 
       if (event.shiftKey) {
         if (document.activeElement === firstFocusable) {
