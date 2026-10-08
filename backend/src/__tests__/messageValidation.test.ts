@@ -53,6 +53,24 @@ beforeEach(() => {
   prisma.job.findUnique.mockResolvedValue(jobWith(CLIENT_ID, FREELANCER_ID));
 });
 
+describe("validateMessageSendAuthorization — self-send", () => {
+  it("throws 400 before looking up a sender who is also the receiver", async () => {
+    await expect(
+      validateMessageSendAuthorization({
+        senderId: CLIENT_ID,
+        receiverId: CLIENT_ID,
+        prismaClient,
+      }),
+    ).rejects.toMatchObject({
+      status: 400,
+      message: "Cannot send a message to yourself.",
+    });
+
+    expect(prisma.user.findUnique).not.toHaveBeenCalled();
+    expect(prisma.job.findUnique).not.toHaveBeenCalled();
+  });
+});
+
 // ─── Receiver lookup (#1436) ──────────────────────────────────────────────────
 
 describe("validateMessageSendAuthorization — receiver (#1436)", () => {

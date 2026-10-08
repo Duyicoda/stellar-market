@@ -179,7 +179,13 @@ router.get("/",
   validate({ query: getMessagesQuerySchema.merge(paginationSchema) }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
     const jobId = req.query.jobId as string | undefined;
+    const senderId = req.query.senderId as string | undefined;
+    const receiverId = req.query.receiverId as string | undefined;
     const participantId = req.query.participantId as string | undefined;
+    const messageFilters = [
+      ...(senderId ? [{ senderId }] : []),
+      ...(receiverId ? [{ receiverId }] : []),
+    ];
     const page = Number(req.query.page) || 1;
     const limit = Number(req.query.limit) || 10;
     const skip = (page - 1) * limit;
@@ -194,6 +200,7 @@ router.get("/",
               { senderId: participantId as string, receiverId: req.userId! },
             ],
           },
+          ...messageFilters,
         ],
       };
 
@@ -225,10 +232,15 @@ router.get("/",
     }
 
     // Fetch all messages involving the user to construct conversation list
+    const userMessagesWhere = {
+      OR: [{ senderId: req.userId! }, { receiverId: req.userId! }],
+    };
+    const where =
+      messageFilters.length > 0
+        ? { AND: [userMessagesWhere, ...messageFilters] }
+        : userMessagesWhere;
     const allMessages = await prisma.message.findMany({
-      where: {
-        OR: [{ senderId: req.userId! }, { receiverId: req.userId! }],
-      },
+      where,
       include: {
         sender: { select: { id: true, username: true, avatarUrl: true } },
         receiver: { select: { id: true, username: true, avatarUrl: true } },
